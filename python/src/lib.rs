@@ -338,7 +338,7 @@ impl EngineRpcClient {
     ///     tp_rank: Tensor parallel rank
     ///     pp_rank: Pipeline parallel rank
     ///     device_id: device ID
-    ///     saves: List of (layer_name, block_ids, block_hashes) tuples
+    ///     saves: List of (layer_name, block_ids, block_hashes) tuples.
     ///
     /// Returns: (ok: bool, message: str)
     #[pyo3(signature = (instance_id, tp_rank, pp_rank, device_id, saves))]

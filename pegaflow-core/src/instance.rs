@@ -17,11 +17,6 @@
 //! connector-side guess from model config) is what makes optional speculative
 //! MTP layers, external drafters, and hybrid attention layouts work without
 //! special cases: the layer set *is* the topology.
-//!
-//! One engine instance serves the workers of one node: all `world_size`
-//! workers must register with the same server. This is not new to sealing —
-//! CUDA IPC registration is same-host only, and the session watcher and
-//! query-lease consumption already count to `world_size` on a single server.
 
 use parking_lot::Mutex;
 use std::{
@@ -29,16 +24,16 @@ use std::{
     sync::Arc,
 };
 
-use cudarc::driver::CudaContext;
 use log::info;
 
+use crate::device::DeviceContext;
 use crate::layout::KVCacheLayout;
 use crate::{EngineError, TransferMode, gpu_worker::GpuWorkerPool};
 use pegaflow_common::NumaNode;
 
 /// Registration state protected by a single mutex.
 struct RegistrationState {
-    /// GPU contexts indexed by CUDA device ID.
+    /// GPU contexts indexed by device ID.
     gpu_contexts: HashMap<i32, Arc<GpuContext>>,
 
     /// Sealed layer-id space. `None` while workers are still registering.
@@ -223,12 +218,12 @@ impl LayerTopology {
 /// Per-GPU execution context.
 ///
 /// Each `GpuContext` manages:
-/// - CUDA context lifetime for a specific device
+/// - Device context lifetime for a specific device (CUDA or Ascend)
 /// - KV cache registrations for all layers on this GPU
 /// - Asynchronous worker pool for load/save operations
 /// - NUMA affinity for memory allocation optimization
 pub struct GpuContext {
-    /// CUDA device ID for diagnostics and duplicate registration checks.
+    /// Device ID for diagnostics and duplicate registration checks.
     device_id: i32,
 
     /// Effective TP rank represented by this GPU context.
@@ -243,8 +238,8 @@ pub struct GpuContext {
     /// KV cache layouts by layer name.
     kv_caches: HashMap<String, KVCacheLayout>,
 
-    /// CUDA context handle (kept alive for the lifetime of this context).
-    _cuda_ctx: Arc<CudaContext>,
+    /// Device context handle (kept alive for the lifetime of this context).
+    _device_ctx: DeviceContext,
 
     /// Worker thread pool for asynchronous GPU operations.
     worker_pool: GpuWorkerPool,
@@ -258,10 +253,10 @@ impl GpuContext {
     /// memory locality during transfers.
     ///
     /// # Errors
-    /// Returns `EngineError::CudaInit` if CUDA context creation or worker
+    /// Returns `EngineError::DeviceInit` if device context creation or worker
     /// pool initialization fails.
     fn new(
-        cuda_ctx: Arc<CudaContext>,
+        device_ctx: DeviceContext,
         device_id: i32,
         tp_rank: usize,
         pp_rank: usize,
@@ -269,7 +264,8 @@ impl GpuContext {
         transfer_mode: TransferMode,
         kv_caches: HashMap<String, KVCacheLayout>,
     ) -> Result<Self, EngineError> {
-        let worker_pool = GpuWorkerPool::spawn(device_id, numa_node, transfer_mode)?;
+        let worker_pool =
+            GpuWorkerPool::spawn(device_id, device_ctx.clone(), numa_node, transfer_mode)?;
 
         Ok(Self {
             device_id,
@@ -277,7 +273,7 @@ impl GpuContext {
             pp_rank,
             preferred_numa: numa_node,
             kv_caches,
-            _cuda_ctx: cuda_ctx,
+            _device_ctx: device_ctx,
             worker_pool,
         })
     }
@@ -287,7 +283,7 @@ impl GpuContext {
         self.preferred_numa
     }
 
-    /// CUDA device ID represented by this shard.
+    /// Device ID represented by this shard.
     pub(crate) fn device_id(&self) -> i32 {
         self.device_id
     }
@@ -547,14 +543,62 @@ impl InstanceContext {
         })
     }
 
-    /// Build a GPU context for the specified device.
+    /// Build a device context for the specified device.
     ///
-    /// This method lazily initializes CUDA contexts as devices are first accessed.
-    /// The `numa_node` should be obtained from `NumaTopology::numa_for_gpu()`.
+    /// Depending on the build features, this initializes a CUDA context
+    /// (via `cudarc`) or an Ascend device handle.
     ///
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
-    /// or `EngineError::CudaInit` if CUDA context creation fails.
+    /// or `EngineError::DeviceInit` if device context creation fails.
+    fn build_device_context(
+        &self,
+        device_id: i32,
+    ) -> Result<DeviceContext, EngineError> {
+        if device_id < 0 {
+            return Err(EngineError::InvalidArgument(format!(
+                "device_id {device_id} must be >= 0"
+            )));
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            use crate::device::cuda::CudaDevice;
+            let cuda = CudaDevice::new(device_id).map_err(|e| {
+                EngineError::DeviceInit(format!("CUDA device {device_id}: {e}"))
+            })?;
+            return Ok(DeviceContext::Cuda(Box::new(cuda)));
+        }
+
+        #[cfg(all(feature = "ascend", not(feature = "cuda")))]
+        {
+            use crate::device::ascend::AscendDevice;
+            let ascend = AscendDevice::new(device_id).map_err(|e| {
+                EngineError::DeviceInit(format!("Ascend device {device_id}: {e}"))
+            })?;
+            return Ok(DeviceContext::Ascend(ascend));
+        }
+
+        // No device feature enabled
+        #[cfg(not(any(feature = "cuda", feature = "ascend")))]
+        {
+            Err(EngineError::DeviceInit(
+                "no device backend enabled (build with --features cuda-12 or --features ascend)"
+                    .into(),
+            ))
+        }
+    }
+
+    /// Build a GPU context for the specified device.
+    ///
+    /// This method lazily initializes the device context as devices are first
+    /// accessed. The `numa_node` should be obtained from
+    /// `NumaTopology::numa_for_gpu()`.
+    ///
+    /// # Errors
+    /// Returns `EngineError::InvalidArgument` for negative device IDs,
+    /// or `EngineError::DeviceInit` if device context creation fails.
+    #[allow(dead_code)]
     fn build_gpu_context(
         &self,
         device_id: i32,
@@ -566,16 +610,14 @@ impl InstanceContext {
     ) -> Result<Arc<GpuContext>, EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
-                "device_id {} must be >= 0",
-                device_id
+                "device_id {device_id} must be >= 0",
             )));
         }
 
-        let cuda_ctx = CudaContext::new(device_id as usize)
-            .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
+        let device_ctx = self.build_device_context(device_id)?;
 
         Ok(Arc::new(GpuContext::new(
-            cuda_ctx,
+            device_ctx,
             device_id,
             tp_rank,
             pp_rank,
@@ -623,7 +665,7 @@ impl InstanceContext {
     /// # Errors
     /// - `EngineError::InvalidArgument` if the GPU is already registered, the
     ///   instance is already sealed, or sealing detects an invalid topology
-    /// - `EngineError::CudaInit` if GPU context creation fails
+    /// - `EngineError::DeviceInit` if GPU context creation fails
     pub(crate) fn register_new_gpu(
         &self,
         registration: GpuRegistration,

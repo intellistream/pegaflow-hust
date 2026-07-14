@@ -16,6 +16,7 @@ from pegaflow.connector.common import (
     logger,
 )
 from pegaflow.connector.connector_metrics import PrefetchTracker
+from pegaflow.debug_save import debug_save_enabled
 from pegaflow.pegaflow import QueryLoading, QueryReady
 
 if TYPE_CHECKING:
@@ -104,6 +105,9 @@ class SchedulerConnector:
         # Completion tracking
         self._pending_saves: set[str] = set()
         self._held_requests: set[str] = set()
+        # Final save intents from finished requests whose blocks were never
+        # saved because scheduled_tokens < virtual_block_size (short prompts).
+        self._final_save_intents: dict[str, SaveIntent] = {}
 
     def get_num_new_matched_tokens(
         self,
@@ -387,6 +391,12 @@ class SchedulerConnector:
 
         save_intents = potential_saves
 
+        # Merge final save intents from requests that finished this step
+        # (blocks that were never saved because scheduled < virtual_block_size).
+        if self._final_save_intents:
+            save_intents.update(self._final_save_intents)
+            self._final_save_intents.clear()
+
         # Track requests with pending saves
         self._pending_saves.update(save_intents.keys())
 
@@ -425,6 +435,22 @@ class SchedulerConnector:
         saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
         new_blocks = saveable_block_idx - start_block_idx
         if new_blocks <= 0:
+            if debug_save_enabled():
+                logger.info(
+                    "[PegaKVConnector.DEBUG] req=%s _consume_save_intent skipped: "
+                    "scheduled=%d virtual_block_size=%d allocated=%d "
+                    "saveable_block_idx=%d start_block_idx=%d new_blocks=%d "
+                    "base_block_idx=%d total_hashes=%d",
+                    req_id,
+                    scheduled,
+                    self._ctx.virtual_block_size,
+                    len(allocated),
+                    saveable_block_idx,
+                    start_block_idx,
+                    new_blocks,
+                    base_block_idx,
+                    len(block_hashes),
+                )
             return None
 
         self._next_stored_block_idx[req_id] = saveable_block_idx
@@ -449,6 +475,51 @@ class SchedulerConnector:
             block_hashes=save_hashes,
         )
 
+    def _consume_final_save_intent(self, req_id: str) -> SaveIntent | None:
+        """Generate a save intent covering all remaining unsaved blocks.
+
+        Called from ``request_finished`` when a request completes but
+        ``_consume_save_intent`` never produced a save intent because
+        ``scheduled < virtual_block_size`` (e.g. short prompts).
+        """
+        block_hashes = self._block_hashes.get(req_id)
+        if block_hashes is None:
+            return None
+
+        allocated = self._allocated_blocks.get(req_id, [])
+        if not allocated:
+            return None
+
+        base_block_idx = self._block_index_offsets.get(req_id, 0)
+        start_block_idx = self._next_stored_block_idx.get(req_id, base_block_idx)
+
+        # On request finish, all allocated blocks have been computed.
+        # Calculate how many blocks remain to be saved.
+        saveable_block_idx = min(len(block_hashes), base_block_idx + len(allocated))
+        new_blocks = saveable_block_idx - start_block_idx
+        if new_blocks <= 0:
+            return None
+
+        self._next_stored_block_idx[req_id] = saveable_block_idx
+        hash_start = start_block_idx
+        save_hashes = block_hashes[hash_start : hash_start + new_blocks]
+        save_block_ids = allocated[hash_start : hash_start + new_blocks]
+
+        logger.debug(
+            "[PegaKVConnector] req=%s final_save_intent: start=%d new_blocks=%d "
+            "total_allocated=%d total_hashes=%d",
+            req_id,
+            hash_start,
+            new_blocks,
+            len(allocated),
+            len(block_hashes),
+        )
+
+        return SaveIntent(
+            block_ids=tuple(save_block_ids),
+            block_hashes=save_hashes,
+        )
+
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         for req_id in connector_output.finished_sending or []:
             self._pending_saves.discard(req_id)
@@ -465,6 +536,19 @@ class SchedulerConnector:
         block_ids: list[int],  # noqa: ARG002 - required by vLLM interface
     ) -> tuple[bool, dict | None]:
         req_id = request.request_id
+
+        # When a request finishes before accumulating virtual_block_size tokens,
+        # no save intent was ever generated for its computed blocks. Generate a
+        # final save intent here so those blocks can still be persisted.
+        if (
+            self._ctx.write_enabled
+            and req_id in self._block_hashes
+            and req_id not in self._pending_saves
+        ):
+            final_save = self._consume_final_save_intent(req_id)
+            if final_save is not None:
+                self._final_save_intents[req_id] = final_save
+                self._pending_saves.add(req_id)
 
         # Check if there are pending saves for this request
         if req_id in self._pending_saves:

@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaStream, sys};
+use cudarc::driver::sys;
+
+use crate::device::DeviceStream;
+use crate::device::cuda::CudaDeviceStream;
 
 use super::{CopyDesc, TransferBackend};
 
@@ -52,11 +55,15 @@ fn merge(copies: &[CopyDesc]) -> Vec<Merged> {
     out
 }
 
-/// DMA copy-engine transfer backend.
+/// DMA copy-engine transfer backend (CUDA).
 pub struct MemcpyBackend;
 
 impl TransferBackend for MemcpyBackend {
-    fn h2d(&self, copies: &[CopyDesc], stream: &Arc<CudaStream>) -> Result<(), String> {
+    fn h2d(&self, copies: &[CopyDesc], stream: &Arc<DeviceStream>) -> Result<(), String> {
+        let cuda_stream = match stream.as_ref() {
+            DeviceStream::Cuda(s) => s,
+            _ => return Err("MemcpyBackend::h2d called with non-CUDA stream".into()),
+        };
         for m in merge(copies) {
             // SAFETY: `m.device` is a valid device address and `m.host` is pinned
             // host memory kept alive by the caller until the stream is
@@ -66,7 +73,7 @@ impl TransferBackend for MemcpyBackend {
                     m.device,
                     m.host as *const std::ffi::c_void,
                     m.size,
-                    stream.cu_stream(),
+                    cuda_stream.cu_stream(),
                 )
             };
             if result != sys::cudaError_enum::CUDA_SUCCESS {
@@ -76,7 +83,11 @@ impl TransferBackend for MemcpyBackend {
         Ok(())
     }
 
-    fn d2h(&self, copies: &[CopyDesc], stream: &Arc<CudaStream>) -> Result<(), String> {
+    fn d2h(&self, copies: &[CopyDesc], stream: &Arc<DeviceStream>) -> Result<(), String> {
+        let cuda_stream = match stream.as_ref() {
+            DeviceStream::Cuda(s) => s,
+            _ => return Err("MemcpyBackend::d2h called with non-CUDA stream".into()),
+        };
         for m in merge(copies) {
             // SAFETY: same invariants as `h2d`, reversed direction.
             let result = unsafe {
@@ -84,7 +95,7 @@ impl TransferBackend for MemcpyBackend {
                     m.host as *mut std::ffi::c_void,
                     m.device,
                     m.size,
-                    stream.cu_stream(),
+                    cuda_stream.cu_stream(),
                 )
             };
             if result != sys::cudaError_enum::CUDA_SUCCESS {

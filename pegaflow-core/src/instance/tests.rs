@@ -281,8 +281,15 @@ fn registration_without_layers_is_rejected() {
 /// True when the host exposes at least `n` CUDA devices. Multi-worker sealing
 /// contract tests need one real CUDA context per device; on smaller boxes
 /// they skip instead of failing.
+#[cfg(feature = "cuda")]
 fn has_cuda_devices(n: usize) -> bool {
-    (0..n).all(|device_id| CudaContext::new(device_id).is_ok())
+    (0..n).all(|device_id| cudarc::driver::CudaContext::new(device_id).is_ok())
+}
+
+/// Ascend variant: always false until we have Ascend device detection.
+#[cfg(not(feature = "cuda"))]
+fn has_cuda_devices(_n: usize) -> bool {
+    false
 }
 
 /// The layer-id space is the union of what workers actually register — no

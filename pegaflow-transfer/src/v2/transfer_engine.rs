@@ -9,7 +9,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use crate::cuda_lib::Device;
+use crate::device::Device;
 use dashmap::DashMap;
 use log::{error, warn};
 use parking_lot::Mutex;

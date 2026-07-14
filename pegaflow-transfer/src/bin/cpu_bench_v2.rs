@@ -1,5 +1,7 @@
 //! CPU-memory RDMA benchmark for the v2 transfer engine.
 //!
+//! Requires CUDA feature (`--features cuda-12` / `cuda-13`).
+//!
 //! Models the PD push data path: prefill writes blocks into decode memory, then
 //! sends an immediate as the task completion signal.
 

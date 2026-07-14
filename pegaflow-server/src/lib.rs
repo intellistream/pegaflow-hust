@@ -1,3 +1,6 @@
+#[cfg(feature = "ascend")]
+mod check_ascend_version;
+#[cfg(not(feature = "ascend"))]
 mod check_cuda_version;
 pub mod http_server;
 pub mod metric;
@@ -14,11 +17,10 @@ mod trace {
 }
 mod utils;
 
-pub use registry::{DeviceTensorRegistry, RegistryHandle};
+pub use registry::{CudaTensorRegistry, RegistryHandle};
 pub use service::GrpcEngineService;
 
 use clap::Parser;
-use cudarc::driver::result as cuda_driver;
 use log::{error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
@@ -26,7 +28,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use pegaflow_core::PegaEngine;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
-use pyo3::{PyErr, Python, types::PyAnyMethods};
+use pyo3::{Py, PyAny, PyErr, Python, types::PyAnyMethods};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -290,9 +292,31 @@ fn format_py_err(err: PyErr) -> String {
 }
 
 fn init_device() -> Result<(), std::io::Error> {
-    // Try CUDA driver init; if it fails, assume Ascend NPU (which does not
-    // require a separate driver init — torch.npu handles it internally).
-    let _ = cuda_driver::init();
+    // On Ascend, initialize the ACL runtime and set device 0 as the
+    // active device for the calling (main) thread. This must happen
+    // before any ACL API calls in pegaflow-core.
+    #[cfg(feature = "ascend")]
+    {
+        pegaflow_core::device::ascend::ensure_acl_initialized()
+            .map_err(|e| std::io::Error::other(format!("aclInit failed: {e}")))?;
+        // Set device 0 as the default for the main thread so that
+        // subsequent ACL operations (e.g. aclrtMallocHost in pinned_mem)
+        // succeed without an explicit per-thread set_device.
+        let device = pegaflow_core::device::ascend::AscendDevice::new(0)
+            .map_err(|e| std::io::Error::other(format!("AscendDevice::new(0) failed: {e}")))?;
+        device
+            .set_current()
+            .map_err(|e| std::io::Error::other(format!("aclrtSetDevice(0) failed: {e}")))?;
+        log::info!("Ascend ACL runtime initialized, device 0 set as current");
+    }
+    // On CUDA, initialise the driver. cudarc::driver::init() is a no-op
+    // if the driver is already loaded, but calling it ensures the CUDA
+    // driver symbols are resolved before any other CUDA API calls.
+    #[cfg(not(feature = "ascend"))]
+    {
+        use cudarc::driver::result as cuda_driver;
+        let _ = cuda_driver::init();
+    }
     Ok(())
 }
 
@@ -341,7 +365,7 @@ fn init_python_device(device_ids: &[i32]) -> Result<(), std::io::Error> {
         let torch = py.import("torch")?;
 
         // Detect which device backend is available.
-        let (dev, prefix): (PyObject, &str) = if let Ok(npu) = torch.getattr("npu") {
+        let (dev, prefix): (Py<PyAny>, &str) = if let Ok(npu) = torch.getattr("npu") {
             npu.call_method0("init")?;
             (npu.into(), "npu")
         } else {
@@ -352,14 +376,14 @@ fn init_python_device(device_ids: &[i32]) -> Result<(), std::io::Error> {
 
         for &device_id in device_ids {
             let start = std::time::Instant::now();
-            let _ = dev.call_method1("set_device", (device_id,))?;
+            let _ = dev.call_method1(py, "set_device", (device_id,))?;
 
             let device_str = format!("{}:{}", prefix, device_id);
             let empty_args = (vec![1i64],);
             let kwargs = pyo3::types::PyDict::new(py);
             kwargs.set_item("device", device_str)?;
             let _ = torch.call_method("empty", empty_args, Some(&kwargs))?;
-            let _ = dev.call_method1("synchronize", ());
+            let _ = dev.call_method1(py, "synchronize", ());
 
             let elapsed = start.elapsed();
             log::info!(
@@ -368,7 +392,7 @@ fn init_python_device(device_ids: &[i32]) -> Result<(), std::io::Error> {
                 elapsed.as_secs_f64()
             );
         }
-        let _ = dev.call_method1("set_device", (device_ids[0],));
+        let _ = dev.call_method1(py, "set_device", (device_ids[0],));
         Ok(())
     })
     .map_err(|err| {
@@ -451,6 +475,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // Initialize device in the main thread before starting Tokio runtime
     init_device()?;
+    #[cfg(feature = "ascend")]
+    check_ascend_version::preflight()?;
+    #[cfg(not(feature = "ascend"))]
     check_cuda_version::preflight()?;
 
     // Determine which devices to initialize
@@ -479,7 +506,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         devices
     );
 
-    let registry = DeviceTensorRegistry::new().map_err(|err| {
+    let registry = CudaTensorRegistry::new().map_err(|err| {
         let msg = format_py_err(err);
         std::io::Error::other(format!("failed to initialize torch device context: {msg}"))
     })?;

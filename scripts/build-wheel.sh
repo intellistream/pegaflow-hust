@@ -31,6 +31,17 @@ for bin in pegaflow-server-py pegaflow-metaserver-py; do
     chmod +x "$PYTHON_DIR/pegaflow/$bin"
 done
 
+echo "==> Building CANN IPC C extension..."
+C_EXT_DIR="$PYTHON_DIR/pegaflow/npu_ipc_bindings"
+if command -v python3 &> /dev/null; then
+    (cd "$C_EXT_DIR" && python3 setup.py build_ext --inplace) || \
+        echo "WARNING: C extension build failed; ctypes fallback will be used at runtime"
+    # Clean build artifacts but keep the .so
+    rm -rf "$C_EXT_DIR/build"
+else
+    echo "WARNING: python3 not found; skipping C extension build (ctypes fallback)"
+fi
+
 echo "==> Building Python wheel with maturin..."
 cd "$PYTHON_DIR"
 maturin build $RELEASE_FLAG "${EXTRA_ARGS[@]}"

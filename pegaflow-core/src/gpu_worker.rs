@@ -1,17 +1,22 @@
 use std::sync::{Arc, mpsc as std_mpsc};
 
-use cudarc::driver::{CudaContext, CudaStream};
 use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::EngineError;
 use crate::block::{RawBlock, SealedBlock};
+use crate::device::{DeviceContext, DeviceStream};
 use crate::layout::{BlockCopies, KVCacheLayout};
 use crate::metrics::core_metrics;
 use crate::sync_state::LoadState;
-use crate::transfer::{CopyDesc, KernelBackend, MemcpyBackend, TransferBackend, TransferMode};
+use crate::transfer::{CopyDesc, TransferBackend, TransferMode};
+#[cfg(feature = "cuda")]
+use crate::transfer::{KernelBackend, MemcpyBackend};
 use pegaflow_common::{NumaNode, pin_thread_to_numa_node};
+
+#[cfg(feature = "ascend")]
+use crate::transfer::AscendMemcpyBackend;
 
 /// A task to load KV blocks from CPU to GPU for multiple layers
 pub(crate) struct LoadTask {
@@ -104,7 +109,7 @@ pub(crate) struct TransferBlock {
 
 /// A task to save KV blocks from GPU to CPU for multiple layers.
 /// Caller pre-allocates the host blocks, worker does the GPU->CPU copy.
-/// All layers are copied on the same CUDA stream with a single synchronization.
+/// All layers are copied on the same device stream with a single synchronization.
 pub(crate) struct SaveTask {
     pub layers: Vec<LayerTransferData>,
     pub reply: oneshot::Sender<Result<Vec<LayerTransferData>, EngineError>>,
@@ -120,7 +125,7 @@ pub(crate) struct GpuWorkerPool {
 }
 
 impl GpuWorkerPool {
-    /// Spawn a new worker pool for the given GPU device.
+    /// Spawn a new worker pool for the given device.
     ///
     /// Worker threads will be pinned to the specified NUMA node for optimal
     /// memory locality during D2H/H2D transfers. If `numa_node` is unknown
@@ -130,6 +135,7 @@ impl GpuWorkerPool {
     /// lifetime.
     pub(crate) fn spawn(
         device_id: i32,
+        device_ctx: DeviceContext,
         numa_node: NumaNode,
         transfer_mode: TransferMode,
     ) -> Result<Self, EngineError> {
@@ -141,6 +147,7 @@ impl GpuWorkerPool {
         // Spawn load worker thread
         let load_device_id = device_id;
         let load_numa = numa_node;
+        let load_device_ctx = device_ctx.clone();
         std::thread::Builder::new()
             .name(format!("gpu{}-load", device_id))
             .spawn(move || {
@@ -150,7 +157,7 @@ impl GpuWorkerPool {
                 {
                     warn!("Failed to pin load worker to {}: {}", load_numa, e);
                 }
-                match init_worker(load_device_id, transfer_mode) {
+                match init_worker(load_device_id, load_device_ctx, transfer_mode) {
                     Ok(runtime) => {
                         let _ = load_ready_tx.send(Ok(()));
                         load_worker_loop(load_device_id, load_rx, runtime);
@@ -160,11 +167,12 @@ impl GpuWorkerPool {
                     }
                 }
             })
-            .map_err(|e| EngineError::CudaInit(format!("Failed to spawn load worker: {e}")))?;
+            .map_err(|e| EngineError::DeviceInit(format!("Failed to spawn load worker: {e}")))?;
 
         // Spawn save worker thread
         let save_device_id = device_id;
         let save_numa = numa_node;
+        let save_device_ctx = device_ctx;
         std::thread::Builder::new()
             .name(format!("gpu{}-save", device_id))
             .spawn(move || {
@@ -174,7 +182,7 @@ impl GpuWorkerPool {
                 {
                     warn!("Failed to pin save worker to {}: {}", save_numa, e);
                 }
-                match init_worker(save_device_id, transfer_mode) {
+                match init_worker(save_device_id, save_device_ctx, transfer_mode) {
                     Ok(runtime) => {
                         let _ = save_ready_tx.send(Ok(()));
                         save_worker_loop(save_device_id, save_rx, runtime);
@@ -184,7 +192,7 @@ impl GpuWorkerPool {
                     }
                 }
             })
-            .map_err(|e| EngineError::CudaInit(format!("Failed to spawn save worker: {e}")))?;
+            .map_err(|e| EngineError::DeviceInit(format!("Failed to spawn save worker: {e}")))?;
 
         wait_worker_ready("load", device_id, load_ready_rx)?;
         wait_worker_ready("save", device_id, save_ready_rx)?;
@@ -211,7 +219,7 @@ impl GpuWorkerPool {
     }
 
     /// Submit a multi-layer save task (GPU -> CPU) - async, wait for completion.
-    /// All layers are copied on the same CUDA stream with a single synchronization,
+    /// All layers are copied on the same device stream with a single synchronization,
     /// which is significantly faster than submitting individual per-layer tasks.
     pub(crate) async fn batch_save(
         &self,
@@ -243,7 +251,7 @@ impl GpuWorkerPool {
 }
 
 struct WorkerRuntime {
-    stream: Arc<CudaStream>,
+    stream: Arc<DeviceStream>,
     backend: Box<dyn TransferBackend>,
 }
 
@@ -253,40 +261,80 @@ fn wait_worker_ready(
     rx: std_mpsc::Receiver<Result<(), EngineError>>,
 ) -> Result<(), EngineError> {
     rx.recv().map_err(|_| {
-        EngineError::CudaInit(format!(
-            "{worker_name} worker exited before CUDA initialization on device {device_id}"
+        EngineError::DeviceInit(format!(
+            "{worker_name} worker exited before device initialization on device {device_id}"
         ))
     })?
 }
 
 /// Build the configured transfer backend for a worker. The kernel is only
-/// compiled when actually selected.
+/// compiled when actually selected and needs a CUDA context.
 fn build_backend(
     mode: TransferMode,
-    ctx: &std::sync::Arc<CudaContext>,
+    ctx: &DeviceContext,
 ) -> Result<Box<dyn TransferBackend>, EngineError> {
     match mode {
-        TransferMode::Direct => Ok(Box::new(MemcpyBackend)),
+        TransferMode::Direct => {
+            match ctx {
+                #[cfg(feature = "cuda")]
+                DeviceContext::Cuda(_) => Ok(Box::new(MemcpyBackend)),
+                #[cfg(feature = "ascend")]
+                DeviceContext::Ascend(_) => Ok(Box::new(AscendMemcpyBackend)),
+            }
+        }
+        TransferMode::AscendDirect => {
+            #[cfg(feature = "ascend")]
+            {
+                if matches!(ctx, DeviceContext::Ascend(_)) {
+                    return Ok(Box::new(AscendMemcpyBackend));
+                }
+            }
+            Err(EngineError::DeviceInit(
+                "AscendDirect transfer mode requires an Ascend device context".into(),
+            ))
+        }
         TransferMode::Kernel => {
-            let kernel = KernelBackend::new(ctx)
-                .map_err(|e| EngineError::CudaInit(format!("kernel backend init failed: {e}")))?;
-            Ok(Box::new(kernel))
+            #[cfg(feature = "cuda")]
+            {
+                if let DeviceContext::Cuda(ref cuda) = ctx {
+                    let kernel = KernelBackend::new(cuda.inner())
+                        .map_err(|e| EngineError::DeviceInit(format!("kernel backend init failed: {e}")))?;
+                    return Ok(Box::new(kernel));
+                }
+            }
+            Err(EngineError::DeviceInit(
+                "Kernel transfer mode requires a CUDA device context".into(),
+            ))
         }
     }
 }
 
-fn init_worker(device_id: i32, transfer_mode: TransferMode) -> Result<WorkerRuntime, EngineError> {
-    // Initialize CUDA context for this thread
-    let ctx = CudaContext::new(device_id as usize)
-        .map_err(|e| EngineError::CudaInit(format!("Failed to create CUDA context: {e:?}")))?;
-    let stream = ctx
-        .new_stream()
-        .map_err(|e| EngineError::CudaInit(format!("Failed to create CUDA stream: {e:?}")))?;
+fn init_worker(
+    device_id: i32,
+    device_ctx: DeviceContext,
+    transfer_mode: TransferMode,
+) -> Result<WorkerRuntime, EngineError> {
+    // Set the device for this thread (Ascend needs aclrtSetDevice).
+    #[cfg(feature = "ascend")]
+    {
+        let _ = device_ctx; // used inside the if-let below
+        if let DeviceContext::Ascend(ref d) = device_ctx {
+            d.set_current().map_err(|e| {
+                EngineError::DeviceInit(format!("Failed to set Ascend device {device_id}: {e}"))
+            })?;
+        }
+    }
+    #[cfg(not(feature = "ascend"))]
+    let _ = device_ctx;
+
+    let stream = device_ctx
+        .create_stream()
+        .map_err(|e| EngineError::DeviceInit(format!("Failed to create device stream: {e}")))?;
 
     // Set thread-local diagnostic info
     ThreadLocalDiagnostic::insert("device_id", device_id.to_string());
 
-    let backend = build_backend(transfer_mode, &ctx)?;
+    let backend = build_backend(transfer_mode, &device_ctx)?;
 
     info!(
         "GPU worker initialized: device={} backend={}",
@@ -294,7 +342,10 @@ fn init_worker(device_id: i32, transfer_mode: TransferMode) -> Result<WorkerRunt
         backend.name()
     );
 
-    Ok(WorkerRuntime { stream, backend })
+    Ok(WorkerRuntime {
+        stream: Arc::new(stream),
+        backend,
+    })
 }
 
 /// Load worker thread main loop
@@ -414,12 +465,12 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
     Ok((copies, total_bytes))
 }
 
-/// Process a load task: copy blocks from CPU pinned memory to GPU for multiple
-/// layers. All layers and segments are collected into one descriptor batch,
-/// handed to a single backend (memcpy or kernel), then synchronized once.
+/// Process a load task: copy blocks from CPU pinned memory to device for
+/// multiple layers. All layers and segments are collected into one descriptor
+/// batch, handed to a single backend (memcpy or kernel), then synchronized once.
 fn process_load_task(
     layers: &[LayerTransferData],
-    stream: &Arc<CudaStream>,
+    stream: &Arc<DeviceStream>,
     backend: &dyn TransferBackend,
 ) -> Result<(), EngineError> {
     trace_root!("gpu.load_task", _root);
@@ -433,12 +484,9 @@ fn process_load_task(
     backend.h2d(&copies, stream).map_err(EngineError::Storage)?;
 
     // Wait for all transfers to complete
-    let event = stream
-        .record_event(None)
-        .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
-    event
+    stream
         .synchronize()
-        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e:?}")))?;
+        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e}")))?;
 
     let elapsed = start.elapsed();
     let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
@@ -468,12 +516,12 @@ fn process_load_task(
     Ok(())
 }
 
-/// Process a save task: copy blocks from GPU to CPU pinned memory. All layers
+/// Process a save task: copy blocks from device to CPU pinned memory. All layers
 /// and segments are collected into one descriptor batch, handed to a single
 /// backend, then synchronized once.
 fn process_save_task(
     layers: &[LayerTransferData],
-    stream: &Arc<CudaStream>,
+    stream: &Arc<DeviceStream>,
     backend: &dyn TransferBackend,
     #[cfg(feature = "tracing")] trace_ctx: Option<::fastrace::prelude::SpanContext>,
 ) -> Result<(), EngineError> {
@@ -483,15 +531,18 @@ fn process_save_task(
 
     let (copies, total_bytes) = build_copy_descs(layers)?;
 
+    // TODO(ascend): backend.d2h() requires device memory allocated via
+    // aclrtMallocPhysical.  When camem_allocator integration is complete
+    // (see §7.2 方案 A/B), this call will succeed natively.  Until then,
+    // it returns Err(EngineError::Storage("aclrtMemcpyAsync(D2H) failed: 507899")).
+    // No fallback is attempted — the synchronous aclrtMemcpy fallback may
+    // segfault on non-aclrtMallocPhysical memory (ascend.rs:408-415).
     backend.d2h(&copies, stream).map_err(EngineError::Storage)?;
 
     // Single synchronization for all layers
-    let event = stream
-        .record_event(None)
-        .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
-    event
+    stream
         .synchronize()
-        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e:?}")))?;
+        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e}")))?;
 
     let elapsed = start.elapsed();
     let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {

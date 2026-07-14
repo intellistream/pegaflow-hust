@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pegaflow-llm-hust"
+name = "pegaflow-llm-npu"
 version = "0.23.0"
 description = "High-performance key-value storage engine with Python bindings"
 readme = "README.md"
@@ -45,7 +45,7 @@ test = [
     "requests>=2.26.0",
 ]
 dev = [
-    "pegaflow-llm[test]",
+    "pegaflow-llm-npu[test]",
     "ruff>=0.4",
     "mypy>=1.10",
 ]

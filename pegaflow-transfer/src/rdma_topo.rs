@@ -204,13 +204,15 @@ impl SystemTopology {
 }
 
 // ============================================================================
-// GPU detection
+// Accelerator detection (GPU / NPU)
 // ============================================================================
 
 /// Detect all GPUs with PCI address and NUMA affinity.
 ///
 /// Uses a single `nvidia-smi` call to get device index and PCI bus ID,
 /// then reads NUMA node from sysfs.
+/// On Ascend systems (`feature = "ascend"`), also queries NPU devices via
+/// `/sys/class/davinci` sysfs entries.
 fn detect_gpus() -> Vec<GpuInfo> {
     let output = match Command::new("nvidia-smi")
         .args(["--query-gpu=index,pci.bus_id", "--format=csv,noheader"])

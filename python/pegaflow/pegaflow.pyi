@@ -1,7 +1,7 @@
 """Type stubs for the pegaflow Rust extension module (PyO3 bindings).
 
 This module provides high-performance KV cache storage and gRPC client
-for distributed LLM inference with vLLM.
+for distributed LLM inference with vLLM, supporting both CUDA and Ascend NPU.
 """
 
 __version__: str
@@ -17,6 +17,40 @@ class PegaflowInternal(PegaFlowError):
     """Internal server error."""
 
     ...
+
+
+# ---------------------------------------------------------------------------
+# NpuIPCWrapper — CANN IPC key wrapper (Python-only, no Rust binding)
+# ---------------------------------------------------------------------------
+
+class NpuIPCWrapper:
+    """Wrapper for CANN IPC key with tensor metadata.
+
+    This class wraps a PyTorch NPU tensor and extracts its CANN IPC key,
+    allowing the tensor memory to be reconstructed in another process via
+    ``aclrtIpcMemImportByKey``.  The wrapper is pickle-serialisable so it
+    travels through gRPC ``register_context_batch`` unchanged.
+
+    Attributes:
+        key: CANN IPC export key bytes (C string from aclrtIpcMemGetExportKey).
+        dtype: PyTorch dtype of the tensor.
+        shape: Shape tuple of the tensor.
+        stride: Stride tuple of the tensor.
+        storage_offset: Storage offset (must be zero).
+        device_index: NPU device index (relative to ASCEND_VISIBLE_DEVICES).
+    """
+
+    def __init__(self, tensor: object) -> None: ...
+    def to_tensor(self) -> object:
+        """Reconstruct a tensor that shares the original NPU memory.
+
+        Calls ``aclrtIpcMemImportByKey`` with the key exported in
+        ``__init__``, then constructs a ``torch.Tensor`` that points to
+        the imported device virtual address.
+        """
+        ...
+    def __getstate__(self) -> tuple: ...
+    def __setstate__(self, state: tuple) -> None: ...
 
 class QueryLoading:
     def __init__(self) -> None: ...

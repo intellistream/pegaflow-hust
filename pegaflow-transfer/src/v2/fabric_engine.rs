@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use crate::cuda_lib::{CudaDeviceId, Device};
+use crate::device::{CudaDeviceId, Device};
 use dashmap::DashMap;
 
 use crate::v2::{
@@ -290,6 +290,8 @@ impl FabricEngine {
                 .workers
                 .get(device_id)
                 .ok_or(FabricLibError::Custom("Worker not found")),
+            #[cfg(feature = "ascend")]
+            Device::Ascend(_) => self.get_main_worker(),
         }
     }
 

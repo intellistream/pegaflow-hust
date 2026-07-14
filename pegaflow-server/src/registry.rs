@@ -42,11 +42,11 @@ impl ContextState {
     }
 }
 
-pub struct DeviceTensorRegistry {
+pub struct CudaTensorRegistry {
     contexts: HashMap<String, ContextState>,
 }
 
-impl DeviceTensorRegistry {
+impl CudaTensorRegistry {
     pub fn new() -> PyResult<Self> {
         Python::attach(|py| {
             let torch = py.import("torch")?;
@@ -184,7 +184,7 @@ impl DeviceTensorRegistry {
             let pickle = py.import("pickle")?;
 
             // Select the correct device runtime based on what is available.
-            let dev: PyObject = if let Ok(npu) = torch.getattr("npu") {
+            let dev: Py<PyAny> = if let Ok(npu) = torch.getattr("npu") {
                 npu.call_method1("set_device", (device_id,))?;
                 npu.into()
             } else {
@@ -244,7 +244,7 @@ enum RegistryCommand {
     },
 }
 
-/// Async handle to a [`DeviceTensorRegistry`] that lives on its own OS thread.
+/// Async handle to a [`CudaTensorRegistry`] that lives on its own OS thread.
 ///
 /// Every mutating op takes the GIL and may run a blocking
 /// device cache flush — which never returns if the device is wedged. Confining
@@ -262,7 +262,7 @@ pub struct RegistryHandle {
 impl RegistryHandle {
     /// Move `registry` onto a dedicated `device-registry` thread and return an
     /// async handle to it. The thread runs until every handle is dropped.
-    pub fn spawn(registry: DeviceTensorRegistry) -> Self {
+    pub fn spawn(registry: CudaTensorRegistry) -> Self {
         // Bounds how many register/cleanup requests queue before callers await
         // for space; the actor drains them one at a time under the GIL.
         let (tx, rx) = mpsc::channel(64);

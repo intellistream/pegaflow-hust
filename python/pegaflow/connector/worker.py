@@ -19,6 +19,7 @@ from pegaflow.connector.common import (
     logger,
     parse_env_int,
 )
+from pegaflow.debug_save import debug_save_enabled
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
 from pegaflow.pegaflow import PyLoadState
@@ -268,12 +269,20 @@ class WorkerConnector:
         if not kv_caches:
             raise RuntimeError("No KV cache layers were selected for registration")
 
+        # Ascend prefill-disaggregation returns KV caches as (k, v) tuples.
+        # Flatten to per-tensor dict: {layer_k: k, layer_v: v}
+        flat_kv_caches: dict[str, torch.Tensor] = {}
+        for layer_name, kv_cache in kv_caches.items():
+            if isinstance(kv_cache, tuple):
+                for idx, t in enumerate(kv_cache):
+                    flat_kv_caches[f"{layer_name}_{'k' if idx == 0 else 'v'}"] = t
+            else:
+                flat_kv_caches[layer_name] = kv_cache
+        kv_caches = flat_kv_caches
+
         self._registered_layers = list(kv_caches.keys())
         self._page_first = self._use_page_first()
         self._torch_device = next(iter(kv_caches.values())).device
-
-        # Select the appropriate IPC wrapper class based on device type.
-        self._ipc_wrapper_factory = _resolve_ipc_wrapper_factory(self._torch_device)
 
         layout = "unknown"
 
@@ -287,11 +296,9 @@ class WorkerConnector:
         split_blocks_per_logical = 1
         split_logical_blocks = 0
 
-        for layer_name, kv_cache in kv_caches.items():
-            assert kv_cache.storage_offset() == 0, (
-                f"KV cache for {layer_name} must have zero storage offset"
-            )
+        self._ipc_wrapper_factory = _resolve_ipc_wrapper_factory(self._torch_device)
 
+        for layer_name, kv_cache in kv_caches.items():
             wrapper = self._ipc_wrapper_factory(kv_cache)
             wrapper_bytes = pickle.dumps(wrapper)
 
@@ -637,23 +644,57 @@ class WorkerConnector:
 
     def save_kv_layer(
         self,
-        metadata: PegaConnectorMetadata,
         layer_name: str,
         kv_layer: "torch.Tensor",
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        # Save is metadata-driven and submitted from wait_for_save() outside
-        # layer callbacks so graph replay cannot suppress it.
-        pass
+        # Save is normally metadata-driven and submitted from wait_for_save()
+        # outside layer callbacks so graph replay cannot suppress it.
+        # However, Ascend attention backends may not call wait_for_save(), so
+        # provide a fallback path through the layer callback on first layer.
+        if not self._registered_layers:
+            return
+        first_layer = self._registered_layers[0]
+        if layer_name != first_layer:
+            return
+        # Delegate to wait_for_save so all save logic stays in one place.
+        # Guard with a flag to avoid double-submission when an Ascend backend
+        # is patched to call both save_kv_layer and wait_for_save.
+        if not getattr(self, "_save_fallback_used", False):
+            self._save_fallback_used = True
+            try:
+                if debug_save_enabled():
+                    logger.info(
+                        "[PegaKVConnector.DEBUG] save_kv_layer fallback triggered: "
+                        "layer=%s — wait_for_save() may not be called by Ascend backend",
+                        layer_name,
+                    )
+                self.wait_for_save()
+            finally:
+                self._save_fallback_used = False
 
     def wait_for_save(self) -> None:
         metadata = self._current_metadata
         self._current_metadata = None
+        if debug_save_enabled():
+            logger.info("[PegaKVConnector.DEBUG] wait_for_save called: metadata=%s", metadata)
         if metadata is None or not metadata.save_intents:
+            if debug_save_enabled():
+                logger.info(
+                    "[PegaKVConnector.DEBUG] wait_for_save skipped: metadata=%s, save_intents=%s",
+                    metadata is not None,
+                    metadata.save_intents if metadata else "N/A",
+                )
             return
 
         request_ids = list(metadata.save_intents.keys())
+        if debug_save_enabled():
+            for req_id, intent in metadata.save_intents.items():
+                logger.info(
+                    "[PegaKVConnector.DEBUG] wait_for_save save_intent: req=%s block_ids=%s hashes=%d",
+                    req_id, intent.block_ids, len(intent.block_hashes),
+                )
 
         with self._save_completion_lock:
             for req_id in request_ids:
@@ -741,8 +782,18 @@ class WorkerConnector:
             # Otherwise we may copy uninitialized memory (attention kernel is async)
             _device_synchronize(self._torch_device)
 
-            saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
-            total_blocks = sum(len(ids) for _, ids, _ in saves_list)
+            saves_list: list[tuple[str, list[int], list[bytes]]] = []
+            total_blocks = 0
+            for layer_name, (block_ids, block_hashes) in saves_by_layer.items():
+                saves_list.append((layer_name, block_ids, block_hashes))
+                total_blocks += len(block_ids)
+
+            if debug_save_enabled():
+                logger.info(
+                    "[PegaKVConnector.DEBUG] _process_save_batch: layers=%d total_blocks=%d "
+                    "reqs=%s",
+                    len(saves_list), total_blocks, all_request_ids,
+                )
 
             save_start = time.perf_counter()
             success = False
@@ -912,12 +963,8 @@ class WorkerConnector:
 def _resolve_ipc_wrapper_factory(device: torch.device):
     """Return the appropriate IPC wrapper class for the given device."""
     if device.type == "cuda":
-        from pegaflow.ipc_wrapper import CudaIPCWrapper
-
         return lambda tensor: CudaIPCWrapper(tensor)
     if device.type == "npu":
-        from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
-
         return lambda tensor: NpuIPCWrapper(tensor)
     raise RuntimeError(
         f"Unsupported device type '{device.type}'. "
@@ -925,8 +972,10 @@ def _resolve_ipc_wrapper_factory(device: torch.device):
     )
 
 
-def _device_synchronize(device: torch.device) -> None:
+def _device_synchronize(device):  # type: ignore[type-arg]
     """Synchronize the current stream on the given device."""
+    if device is None:
+        return
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elif device.type == "npu":

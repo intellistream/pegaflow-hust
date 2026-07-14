@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
-use crate::cuda_lib::Device;
+use crate::device::Device;
 use parking_lot::Mutex;
 
 use crate::v2::{RdmaEngine, api::MemoryRegionHandle, error::Result};

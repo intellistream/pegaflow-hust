@@ -7,6 +7,7 @@ use std::{
     sync::LazyLock,
 };
 
+#[cfg(not(feature = "ascend"))]
 use crate::cuda_lib::rt::{cudaDeviceProp, cudaGetDeviceCount, cudaGetDeviceProperties};
 
 use crate::v2::{
@@ -70,6 +71,7 @@ impl FromStr for PciAddress {
     }
 }
 
+#[cfg(not(feature = "ascend"))]
 impl From<&cudaDeviceProp> for PciAddress {
     fn from(prop: &cudaDeviceProp) -> Self {
         PciAddress {
@@ -239,6 +241,7 @@ fn read_pci_device_id(pci_addr: &PciAddress) -> Result<PciDeviceId> {
     Ok(PciDeviceId { vendor, device })
 }
 
+#[cfg(not(feature = "ascend"))]
 fn get_gpu_pci_device_id() -> Result<PciDeviceId> {
     let prop = cudaGetDeviceProperties(0)?;
     let pci_addr = PciAddress::from(&prop);
@@ -498,6 +501,7 @@ fn get_visible_domains() -> Vec<DomainInfo> {
         .collect()
 }
 
+#[cfg(not(feature = "ascend"))]
 fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
     // Get the number of visible GPUs and the GPU PCI device ID
     let num_visible_gpus = cudaGetDeviceCount()? as usize;
@@ -568,6 +572,26 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
     }
 
     Ok(topo_groups)
+}
+
+#[cfg(feature = "ascend")]
+fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
+    // Ascend: topology detection based on PCIe topology + Verbs NICs only.
+    // GPU detection through CUDA runtime is unavailable; the caller should
+    // fall back to using the NICs directly for RDMA transfers.
+    let domains = get_visible_domains();
+    if domains.is_empty() {
+        return Err(FabricLibError::Custom("No visible NICs for Ascend RDMA"));
+    }
+
+    // On Ascend systems, return a single topology group with all domains.
+    // NUMA affinity is handled by pegaflow-common's numa.rs.
+    Ok(vec![TopologyGroup {
+        cuda_device: 0,
+        numa: 0,
+        domains,
+        cpus: Vec::new(),
+    }])
 }
 
 static GLOBAL: LazyLock<Result<Vec<TopologyGroup>>> = LazyLock::new(do_detect_topology);

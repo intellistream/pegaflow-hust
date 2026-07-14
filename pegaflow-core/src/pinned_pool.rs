@@ -163,20 +163,46 @@ impl PinnedMemoryPool {
         );
 
         let backing = if use_hugepages {
-            info!("Allocating pinned memory pool with huge pages on {}", node);
-            PinnedMemory::allocate_hugepages(pool_size, node)
-                .expect("Failed to allocate pinned memory pool with huge pages")
+            #[cfg(feature = "cuda")]
+            {
+                info!("Allocating pinned memory pool with huge pages on {}", node);
+                PinnedMemory::allocate_hugepages(pool_size, node)
+                    .expect("Failed to allocate pinned memory pool with huge pages")
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                panic!("HugePages require CUDA feature; use --features ascend");
+            }
         } else if ssd_enabled {
-            info!(
-                "Allocating pinned memory pool with regular pages on {} (SSD enabled)",
-                node
-            );
-            PinnedMemory::allocate_regular(pool_size, node)
-                .expect("Failed to allocate regular pinned memory pool")
+            #[cfg(feature = "cuda")]
+            {
+                info!(
+                    "Allocating pinned memory pool with regular pages on {} (SSD enabled)",
+                    node
+                );
+                PinnedMemory::allocate_regular(pool_size, node)
+                    .expect("Failed to allocate regular pinned memory pool")
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                info!(
+                    "Allocating pinned memory pool with aclrtMallocHost on {} (SSD enabled)",
+                    node
+                );
+                Self::allocate_ascend_host_fallback(pool_size)
+            }
         } else {
-            info!("Allocating pinned memory pool with cudaHostAlloc mapped pages");
-            PinnedMemory::allocate_cuda_host_alloc(pool_size)
-                .expect("Failed to allocate mapped pinned memory pool")
+            #[cfg(feature = "cuda")]
+            {
+                info!("Allocating pinned memory pool with cudaHostAlloc mapped pages");
+                PinnedMemory::allocate_cuda_host_alloc(pool_size)
+                    .expect("Failed to allocate mapped pinned memory pool")
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                info!("Allocating pinned memory pool with aclrtMallocHost mapped pages");
+                Self::allocate_ascend_host_fallback(pool_size)
+            }
         };
 
         let actual_size = backing.size() as u64;
@@ -221,6 +247,14 @@ impl PinnedMemoryPool {
             allocator: Mutex::new(allocator),
             allocatable_bytes,
         }
+    }
+
+    /// Fallback allocation using Ascend's `aclrtMallocHost` when CUDA is not available.
+    #[cfg(all(feature = "ascend", not(feature = "cuda")))]
+    fn allocate_ascend_host_fallback(size: usize) -> PinnedMemory {
+        use crate::pinned_mem::PinnedMemory;
+        PinnedMemory::allocate_ascend_host(size)
+            .expect("Failed to allocate Ascend pinned memory pool via aclrtMallocHost")
     }
 
     /// Allocate pinned memory from the pool. Returns None when the allocation cannot be satisfied.

@@ -27,3 +27,7 @@ python/pegaflow/pegaflow-server-py
 
 # Claude
 CLAUDE.local.md
+
+# Local technical reports
+技术报告*.md
+e2e_*.py

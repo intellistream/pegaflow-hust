@@ -67,6 +67,10 @@ class ConnectorContext:
         return self.mode is PegaConnectorMode.READ_WRITE
 
     @property
+    def write_enabled(self) -> bool:
+        return self.mode in (PegaConnectorMode.READ_WRITE, PegaConnectorMode.SAVE_ONLY)
+
+    @property
     def virtual_block_size(self) -> int:
         """Block size as seen by the scheduler.
 
@@ -246,7 +250,7 @@ def detect_mla(vllm_config) -> bool:
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
 
-_TRANSFER_BACKENDS = ("direct", "kernel")
+_TRANSFER_BACKENDS = ("direct", "kernel", "ascend_direct")
 
 
 def resolve_transfer_backend(is_mla: bool, override: str | None) -> str:

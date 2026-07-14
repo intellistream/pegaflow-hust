@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::cuda_lib::Device;
+use crate::device::Device;
 
 use crate::v2::{
     api::{DomainAddress, MemoryRegionDescriptor, MemoryRegionHandle, TransferRequest},

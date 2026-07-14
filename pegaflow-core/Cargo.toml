@@ -8,14 +8,16 @@ workspace = true
 
 [features]
 default = ["cuda-12", "rdma"]
-cuda-12 = ["cudarc/cuda-12080", "cudarc/nvrtc", "pegaflow-transfer?/cuda-12"]
-cuda-13 = ["cudarc/cuda-13000", "cudarc/nvrtc", "pegaflow-transfer?/cuda-13"]
+cuda = ["dep:cudarc"]
+cuda-12 = ["cuda", "cudarc/cuda-12080", "cudarc/nvrtc", "pegaflow-transfer?/cuda-12"]
+cuda-13 = ["cuda", "cudarc/cuda-13000", "cudarc/nvrtc", "pegaflow-transfer?/cuda-13"]
+ascend = ["pegaflow-transfer?/ascend"]
 rdma = ["dep:pegaflow-transfer"]
 tracing = ["fastrace"]
 
 [dependencies]
 pegaflow-common.workspace = true
-cudarc.workspace = true
+cudarc = { workspace = true, optional = true }
 log.workspace = true
 logforth.workspace = true
 offset-allocator.workspace = true
@@ -41,7 +43,6 @@ mea.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-cudarc.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
 tempfile = "3"

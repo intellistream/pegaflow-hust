@@ -1,5 +1,7 @@
-use crate::cuda_lib::{driver::CudaDriverError, rt::CudartError};
 use syscalls::Errno;
+
+#[cfg(not(feature = "ascend"))]
+use crate::cuda_lib::{driver::CudaDriverError, rt::CudartError};
 
 pub type Result<T> = std::result::Result<T, FabricLibError>;
 
@@ -13,8 +15,10 @@ pub enum FabricLibError {
     VerbsCompletionError(String),
     #[error("CompletionError: {0}")]
     CompletionError(String),
+    #[cfg(not(feature = "ascend"))]
     #[error("{0}")]
     CudaDriver(#[from] CudaDriverError),
+    #[cfg(not(feature = "ascend"))]
     #[error("{0}")]
     Cudart(#[from] CudartError),
     #[error("{0}")]

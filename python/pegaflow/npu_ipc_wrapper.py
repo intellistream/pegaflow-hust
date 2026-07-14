@@ -5,6 +5,10 @@ cross-process NPU memory sharing via CANN IPC keys. The wrapper can be
 serialized (via pickle) and sent across process boundaries.
 
 This is the Ascend equivalent of CudaIPCWrapper (ipc_wrapper.py).
+
+The IPC primitives are implemented via two paths:
+1. C extension (``npu_ipc_bindings._npu_ipc``) — preferred for lower overhead.
+2. ctypes fallback against ``libascendcl.so`` — always available.
 """
 
 import ctypes
@@ -14,7 +18,17 @@ import torch
 
 
 # ---------------------------------------------------------------------------
-# CANN IPC C-level bindings via ctypes
+# CANN IPC constants
+# ---------------------------------------------------------------------------
+
+ACL_SUCCESS = 0
+ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT = 0x0
+ACL_RT_IPC_MEM_IMPORT_FLAG_DEFAULT = 0x0
+NPU_IPC_MAX_KEY_LEN = 256
+
+
+# ---------------------------------------------------------------------------
+# CANN IPC C-level bindings via ctypes (fallback path)
 # ---------------------------------------------------------------------------
 
 def _load_libascendcl():
@@ -47,75 +61,92 @@ def _lib():
     with _libascendcl_lock:
         if _libascendcl is None:
             _libascendcl = _load_libascendcl()
+            # aclInit
+            _libascendcl.aclInit.argtypes = [ctypes.c_char_p]
+            _libascendcl.aclInit.restype = ctypes.c_int
+            _libascendcl.aclrtSetDevice.argtypes = [ctypes.c_int32]
+            _libascendcl.aclrtSetDevice.restype = ctypes.c_int
+            # IPC
             _libascendcl.aclrtIpcMemGetExportKey.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_char_p,
-                ctypes.c_size_t,
-                ctypes.c_uint64,
+                ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p,
+                ctypes.c_size_t, ctypes.c_uint64,
             ]
             _libascendcl.aclrtIpcMemGetExportKey.restype = ctypes.c_int
             _libascendcl.aclrtIpcMemImportByKey.argtypes = [
-                ctypes.POINTER(ctypes.c_void_p),
-                ctypes.c_char_p,
-                ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_uint64,
             ]
             _libascendcl.aclrtIpcMemImportByKey.restype = ctypes.c_int
-            _libascendcl.aclrtIpcMemClose.argtypes = [
-                ctypes.c_char_p,
-            ]
+            _libascendcl.aclrtIpcMemClose.argtypes = [ctypes.c_char_p]
             _libascendcl.aclrtIpcMemClose.restype = ctypes.c_int
+            # Init ACL (idempotent — torch_npu already did it, but safe)
+            _libascendcl.aclInit(None)
         return _libascendcl
 
 
-ACL_SUCCESS = 0
-ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT = 0x0
-ACL_RT_IPC_MEM_IMPORT_FLAG_DEFAULT = 0x0
-NPU_IPC_MAX_KEY_LEN = 256
+def _npu_ipc_export_key_ctypes(dev_ptr: int, size: int, device_index: int) -> bytes:
+    """Export a CANN IPC key for the given NPU memory region (ctypes path).
 
-
-def _npu_ipc_export_key(dev_ptr: int, size: int) -> bytes:
-    """Export a CANN IPC key for the given NPU memory region.
-
-    Returns the key as bytes suitable for serialisation.
+    Must be called with the correct device set via aclrtSetDevice.
     """
+    lib = _lib()
+    lib.aclrtSetDevice(device_index)
     key_buf = ctypes.create_string_buffer(NPU_IPC_MAX_KEY_LEN)
-    ret = _lib().aclrtIpcMemGetExportKey(
-        ctypes.c_void_p(dev_ptr),
-        ctypes.c_size_t(size),
-        key_buf,
-        ctypes.c_size_t(NPU_IPC_MAX_KEY_LEN),
+    ret = lib.aclrtIpcMemGetExportKey(
+        ctypes.c_void_p(dev_ptr), ctypes.c_size_t(size),
+        key_buf, ctypes.c_size_t(NPU_IPC_MAX_KEY_LEN),
         ctypes.c_uint64(ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT),
     )
     if ret != ACL_SUCCESS:
         raise RuntimeError(
             f"aclrtIpcMemGetExportKey failed with error {ret}"
-            f" for dev_ptr={hex(dev_ptr)} size={size}"
+            f" for dev_ptr={hex(dev_ptr)} size={size} device={device_index}"
         )
     return key_buf.value
 
 
-def _npu_ipc_import_key(key: bytes) -> int:
-    """Import NPU memory via a CANN IPC key.
+def _npu_ipc_import_key_ctypes(key: bytes, device_index: int) -> int:
+    """Import NPU memory via a CANN IPC key (ctypes path).
 
-    Returns the device virtual address (integer) of the imported memory.
+    Must be called with the correct device set via aclrtSetDevice.
     """
+    lib = _lib()
+    lib.aclrtSetDevice(device_index)
     dev_ptr = ctypes.c_void_p()
-    ret = _lib().aclrtIpcMemImportByKey(
-        ctypes.byref(dev_ptr),
-        ctypes.c_char_p(key),
+    ret = lib.aclrtIpcMemImportByKey(
+        ctypes.byref(dev_ptr), ctypes.c_char_p(key),
         ctypes.c_uint64(ACL_RT_IPC_MEM_IMPORT_FLAG_DEFAULT),
     )
     if ret != ACL_SUCCESS:
         raise RuntimeError(
-            f"aclrtIpcMemImportByKey failed with error {ret} for key={key!r}"
+            f"aclrtIpcMemImportByKey failed with error {ret}"
+            f" for key={key!r} device={device_index}"
         )
     return dev_ptr.value or 0
 
 
-def _npu_ipc_close(key: bytes) -> None:
-    """Release a CANN IPC key. Idempotent."""
+def _npu_ipc_close_ctypes(key: bytes) -> None:
+    """Release a CANN IPC key (ctypes path). Idempotent."""
     _lib().aclrtIpcMemClose(ctypes.c_char_p(key))
+
+
+# ---------------------------------------------------------------------------
+# Try the C extension for lower overhead
+# ---------------------------------------------------------------------------
+
+_C_EXT_AVAILABLE = False
+try:
+    from pegaflow.npu_ipc_bindings._npu_ipc import (  # type: ignore[import-untyped]
+        export_key as _npu_ipc_export_key_c,
+        import_key as _npu_ipc_import_key_c,
+        close_key as _npu_ipc_close_key_c,
+    )
+    _C_EXT_AVAILABLE = True
+except ImportError:
+    pass
+
+_npu_ipc_export_key = _npu_ipc_export_key_c if _C_EXT_AVAILABLE else _npu_ipc_export_key_ctypes
+_npu_ipc_import_key = _npu_ipc_import_key_c if _C_EXT_AVAILABLE else _npu_ipc_import_key_ctypes
+_npu_ipc_close = _npu_ipc_close_key_c if _C_EXT_AVAILABLE else _npu_ipc_close_ctypes
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +168,11 @@ class NpuIPCWrapper:
     that allocator.  Standard ``torch.npu.empty`` tensors allocated through
     the default CANN allocator are **not** IPC-exportable.
 
-    Device identification uses NPU UUIDs (obtained from
-    ``torch.npu.get_device_properties``) so that ``ASCEND_VISIBLE_DEVICES``
-    remapping is handled correctly.
+    The wrapper stores the NPU device index directly (rather than using
+    UUID-based discovery).  Ascend NPU UUIDs may be non-unique (e.g. all
+    zero), so UUID-based remapping is unreliable.  This is safe because
+    both the vLLM worker and the pegaflow-server process share the same
+    ``ASCEND_VISIBLE_DEVICES`` environment variable and device ordering.
 
     Attributes:
         key: CANN IPC export key bytes (C string from aclrtIpcMemGetExportKey).
@@ -147,44 +180,8 @@ class NpuIPCWrapper:
         shape: Shape tuple of the tensor.
         stride: Stride tuple of the tensor.
         storage_offset: Storage offset (must be zero).
-        device_uuid: UUID string of the NPU device.
+        device_index: NPU device index (relative to ASCEND_VISIBLE_DEVICES).
     """
-
-    _discovered_device_mapping: dict[str, int] = {}
-    _device_mapping_lock = threading.Lock()
-
-    # ------------------------------------------------------------------
-    # Device discovery (analogous to CudaIPCWrapper)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _get_device_uuid(device_index: int) -> str:
-        return str(torch.npu.get_device_properties(device_index).uuid)
-
-    @staticmethod
-    def _discover_npu_devices() -> None:
-        if not torch.npu.is_available():
-            return
-
-        num_devices = torch.npu.device_count()
-        with NpuIPCWrapper._device_mapping_lock:
-            if NpuIPCWrapper._discovered_device_mapping:
-                return
-            for i in range(num_devices):
-                device_uuid = NpuIPCWrapper._get_device_uuid(i)
-                NpuIPCWrapper._discovered_device_mapping[device_uuid] = i
-
-    @staticmethod
-    def _get_device_index_from_uuid(device_uuid: str) -> int:
-        NpuIPCWrapper._discover_npu_devices()
-        with NpuIPCWrapper._device_mapping_lock:
-            device_index = NpuIPCWrapper._discovered_device_mapping.get(device_uuid)
-        if device_index is None:
-            raise RuntimeError(
-                f"Device UUID {device_uuid} not found. "
-                "Make sure the process can see all NPU devices."
-            )
-        return device_index
 
     # ------------------------------------------------------------------
     # Core IPC export / import
@@ -193,71 +190,52 @@ class NpuIPCWrapper:
     def __init__(self, tensor: torch.Tensor):
         """Create an IPC wrapper from an NPU tensor.
 
-        The tensor must be allocated through ``camem_allocator`` (i.e. via
-        ``aclrtMallocPhysical``), otherwise ``aclrtIpcMemGetExportKey`` will
-        fail.
+        Uses ``UntypedStorage._share_npu_()`` — PyTorch's built-in NPU IPC
+        mechanism, matching the ``CudaIPCWrapper`` pattern exactly. This calls
+        ``aclrtIpcMemGetExportKey`` internally with proper device init.
+
+        Views with non-zero ``storage_offset()`` are accepted: the IPC handle
+        is exported for the **underlying storage**, while the wrapper's shape /
+        stride / storage_offset describe the view geometry.
         """
-        if tensor.storage_offset() != 0:
-            raise ValueError("Tensor must have zero storage offset")
-
         storage = tensor.untyped_storage()
-        ptr = storage.data_ptr()
-        nbytes = storage.nbytes()
+        if storage.data_ptr() == 0:
+            raise RuntimeError("Cannot create IPC wrapper for tensor with data_ptr() == 0")
 
-        if ptr == 0:
-            raise RuntimeError("Cannot export IPC key for a tensor with data_ptr() == 0")
+        # Use PyTorch's built-in NPU IPC — same pattern as CudaIPCWrapper
+        # which uses storage._share_cuda_().
+        self._handle: tuple = storage._share_npu_()
 
-        self.key = _npu_ipc_export_key(ptr, nbytes)
         self.dtype = tensor.dtype
         self.shape = tensor.shape
         self.stride = tensor.stride()
         self.storage_offset = tensor.storage_offset()
-
-        device_index = tensor.device.index
-        self.device_uuid = NpuIPCWrapper._get_device_uuid(device_index)
+        self.device_index = tensor.device.index
 
     def to_tensor(self) -> torch.Tensor:
-        """Reconstruct a tensor that shares the original NPU memory.
+        """Reconstruct a real torch.Tensor from the NPU IPC handle.
 
-        Calls ``aclrtIpcMemImportByKey`` with the key exported in
-        ``__init__``, then constructs a ``torch.Tensor`` that points to
-        the imported device virtual address.
+        Uses ``torch_npu._C._new_shared_npu()`` — matching
+        ``CudaIPCWrapper.to_tensor()`` which uses ``_new_shared_cuda()``.
+        Returns a **real** torch.Tensor backed by the imported NPU memory
+        (true zero-copy cross-process sharing).
         """
-        device = NpuIPCWrapper._get_device_index_from_uuid(self.device_uuid)
+        if not hasattr(self, "_handle") or not self._handle:
+            raise RuntimeError(
+                "NpuIPCWrapper has no IPC handle; "
+                "was the serialised wrapper produced by an older version?"
+            )
 
-        dev_ptr = _npu_ipc_import_key(self.key)
+        import torch_npu
+        storage = torch_npu._C._new_shared_npu(*self._handle)
 
-        if dev_ptr == 0:
-            raise RuntimeError("aclrtIpcMemImportByKey returned NULL pointer")
-
-        # Build a torch tensor from the raw NPU pointer.
-        # We use a zero-size host tensor, move it to NPU, then point its
-        # storage at the imported memory.  This is the same pattern
-        # CudaIPCWrapper uses.
-        numel = 1
-        for s in self.shape:
-            numel *= s
-        elem_size = self.dtype.itemsize
-        total_bytes = numel * elem_size
-
-        t = torch.tensor([], device=f"npu:{device}", dtype=self.dtype)
-        stride = getattr(self, "stride", None)
-        storage_offset = getattr(self, "storage_offset", 0)
-
-        # TODO(pegaflow-hust): torch_npu does not expose a public API
-        # equivalent to `torch.UntypedStorage._new_shared_cuda`.  When
-        # torch_npu adds `_new_shared_npu`, replace the raw-pointer
-        # construction below.
-        ptr_as_int = dev_ptr
-        storage = torch.UntypedStorage.from_buffer(
-            (ctypes.c_uint8 * total_bytes).from_address(ptr_as_int),
-            byte_order="native",
-        )
-
-        if stride is None:
-            t.set_(storage, storage_offset)
+        t = torch.tensor([], device=f"npu:{self.device_index}", dtype=self.dtype)
+        st_offset = getattr(self, "storage_offset", 0)
+        st_stride = getattr(self, "stride", None)
+        if st_stride is None:
+            t.set_(storage, st_offset)
             return t.view(self.shape)
-        t.set_(storage, storage_offset, self.shape, stride)
+        t.set_(storage, st_offset, self.shape, st_stride)
         return t
 
     # ------------------------------------------------------------------
@@ -266,41 +244,43 @@ class NpuIPCWrapper:
 
     def __getstate__(self):
         return (
-            self.key,
+            self._handle,
             self.dtype,
             self.shape,
             self.stride,
             self.storage_offset,
-            self.device_uuid,
+            self.device_index,
         )
 
     def __setstate__(self, state):
         (
-            self.key,
+            self._handle,
             self.dtype,
             self.shape,
             self.stride,
             self.storage_offset,
-            self.device_uuid,
+            self.device_index,
         ) = state
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, NpuIPCWrapper):
             return False
         return (
-            self.key == other.key
+            getattr(self, "_handle", None) == getattr(other, "_handle", None)
             and self.dtype == other.dtype
             and self.shape == other.shape
             and getattr(self, "stride", None) == getattr(other, "stride", None)
             and getattr(self, "storage_offset", 0) == getattr(other, "storage_offset", 0)
-            and self.device_uuid == other.device_uuid
+            and self.device_index == other.device_index
         )
 
     def __repr__(self) -> str:
+        has_handle = hasattr(self, "_handle") and bool(getattr(self, "_handle", None))
         return (
             f"NpuIPCWrapper(shape={self.shape}, dtype={self.dtype}, "
             f"stride={getattr(self, 'stride', None)}, "
-            f"device_uuid={self.device_uuid})"
+            f"device_index={self.device_index}, "
+            f"has_handle={has_handle})"
         )
 
 

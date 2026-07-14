@@ -1,8 +1,6 @@
 use std::{ffi::c_void, ptr::NonNull, sync::LazyLock};
 
-use crate::cuda_lib::driver::cu_get_dma_buf_fd;
-use crate::cuda_lib::rt::{cudaMemoryTypeDevice, cudaPointerGetAttributes};
-use crate::cuda_lib::{CudaDeviceId, Device};
+use crate::device::{CudaDeviceId, Device};
 
 use crate::v2::error::{FabricLibError, Result};
 
@@ -27,20 +25,33 @@ impl MemoryRegion {
         let mapping = match device {
             Device::Host => Mapping::Host,
             Device::Cuda(device_id) => {
-                let attrs = cudaPointerGetAttributes(ptr)?;
-                if attrs.type_ != cudaMemoryTypeDevice {
-                    return Err(FabricLibError::Custom("not a device pointer"));
+                #[cfg(not(feature = "ascend"))]
+                {
+                    let attrs = crate::cuda_lib::rt::cudaPointerGetAttributes(ptr)?;
+                    if attrs.type_ != crate::cuda_lib::rt::cudaMemoryTypeDevice {
+                        return Err(FabricLibError::Custom("not a device pointer"));
+                    }
+                    let dmabuf_fd = if linux_kernel_supports_dma_buf() {
+                        crate::cuda_lib::driver::cu_get_dma_buf_fd(ptr, len).ok()
+                    } else {
+                        None
+                    };
+                    Mapping::Device {
+                        device_id,
+                        dmabuf_fd,
+                    }
                 }
-                let dmabuf_fd = if linux_kernel_supports_dma_buf() {
-                    cu_get_dma_buf_fd(ptr, len).ok()
-                } else {
-                    None
-                };
+                #[cfg(feature = "ascend")]
                 Mapping::Device {
                     device_id,
-                    dmabuf_fd,
+                    dmabuf_fd: None,
                 }
             }
+            #[cfg(feature = "ascend")]
+            Device::Ascend(_device_id) => Mapping::Device {
+                device_id: CudaDeviceId(0),
+                dmabuf_fd: None,
+            },
         };
         Ok(MemoryRegion { ptr, len, mapping })
     }

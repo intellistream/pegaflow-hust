@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::cuda_lib::Device;
+use crate::device::Device;
 use libc::ENOMEM;
 use log::{debug, error, info, warn};
 use rdma_mummy_sys::{
@@ -1399,7 +1399,7 @@ mod tests {
     #[test]
     fn cuda_memory_without_dmabuf_uses_legacy_registration() {
         let mapping = Mapping::Device {
-            device_id: crate::cuda_lib::CudaDeviceId(0),
+            device_id: crate::device::CudaDeviceId(0),
             dmabuf_fd: None,
         };
 

@@ -14,6 +14,7 @@ mod allocator;
 mod backing;
 mod block;
 mod cache;
+pub mod device;
 mod gpu_worker;
 mod instance;
 mod internode;
@@ -74,8 +75,8 @@ pub enum EngineError {
     WorkerMissing(String, i32),
     /// Invalid argument provided.
     InvalidArgument(String),
-    /// CUDA initialization or runtime error.
-    CudaInit(String),
+    /// Device initialization or runtime error (CUDA or Ascend).
+    DeviceInit(String),
     /// Storage engine error.
     Storage(String),
     /// Internal lock poisoned.
@@ -92,7 +93,7 @@ impl fmt::Display for EngineError {
                 write!(f, "device {device} not found in instance {ctx}")
             }
             EngineError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
-            EngineError::CudaInit(msg) => write!(f, "failed to initialize CUDA: {msg}"),
+            EngineError::DeviceInit(msg) => write!(f, "failed to initialize device: {msg}"),
             EngineError::Storage(msg) => write!(f, "storage error: {msg}"),
             EngineError::Poisoned(what) => write!(f, "internal lock poisoned: {what}"),
             EngineError::TopologyMismatch(msg) => write!(f, "topology mismatch: {msg}"),
@@ -393,8 +394,8 @@ impl PegaEngine {
         if self.storage.is_numa_enabled() && numa_node.is_unknown() {
             return Err(EngineError::InvalidArgument(format!(
                 "NUMA-aware allocation is enabled, but GPU {} NUMA affinity is unknown. \
-                 Please ensure nvidia-smi is available and GPU NUMA topology is detectable, \
-                 or disable NUMA-aware allocation.",
+                 Please ensure the device management tool (nvidia-smi / npu-smi) is available \
+                 and GPU NUMA topology is detectable, or disable NUMA-aware allocation.",
                 device_id
             )));
         }

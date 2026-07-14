@@ -40,15 +40,28 @@ ruff check python/
 echo -e "${GREEN}✓ Python linting passed${NC}\n"
 
 # Check 5: Clippy for Rust packages
-echo -e "${YELLOW}[5/6] Running clippy for Rust packages...${NC}"
+echo -e "${YELLOW}[5/7] Running clippy for Rust packages...${NC}"
 cargo clippy -p pegaflow-core -p pegaflow-server --all-targets -- -D warnings
 echo -e "${GREEN}✓ Clippy check passed${NC}\n"
 
 # Check 6: Cargo check
-echo -e "${YELLOW}[6/6] Running cargo check...${NC}"
+echo -e "${YELLOW}[6/7] Running cargo check...${NC}"
 cargo check -p pegaflow-core
 cargo check -p pegaflow-server
 echo -e "${GREEN}✓ Cargo check passed${NC}\n"
+
+# Check 7: CANN IPC C extension compilation
+echo -e "${YELLOW}[7/7] Checking CANN IPC C extension compilation...${NC}"
+C_EXT_DIR="python/pegaflow/npu_ipc_bindings"
+if [ -f "$C_EXT_DIR/_npu_ipc.c" ] && [ -f "$C_EXT_DIR/setup.py" ]; then
+    (cd "$C_EXT_DIR" && python3 setup.py build_ext --inplace) && \
+        echo -e "${GREEN}✓ C extension compiled successfully${NC}\n" || \
+        echo -e "${YELLOW}⚠ C extension compilation failed (ctypes fallback will be used)${NC}\n"
+    # Clean build artifacts but keep the .so
+    rm -rf "$C_EXT_DIR/build"
+else
+    echo -e "${YELLOW}⚠ C extension sources not found at $C_EXT_DIR, skipping${NC}\n"
+fi
 
 echo -e "${GREEN}=== All checks passed! ✓ ===${NC}"
 echo -e "You can safely commit and push your changes."

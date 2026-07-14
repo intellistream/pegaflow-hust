@@ -7,6 +7,8 @@
 //! (zero-copy over PCIe). This collapses N driver submissions into one small
 //! descriptor copy plus one launch, which wins when the batch is so fragmented
 //! that per-call launch latency on the memcpy path dominates.
+//!
+//! CUDA-only: requires the `cuda` feature.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -15,6 +17,9 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
+
+use crate::device::DeviceStream;
+use crate::device::cuda::CudaDeviceStream;
 
 use super::{CopyDesc, TransferBackend};
 
@@ -136,12 +141,20 @@ impl KernelBackend {
 }
 
 impl TransferBackend for KernelBackend {
-    fn h2d(&self, copies: &[CopyDesc], stream: &Arc<CudaStream>) -> Result<(), String> {
-        self.submit(copies, true, stream)
+    fn h2d(&self, copies: &[CopyDesc], stream: &Arc<DeviceStream>) -> Result<(), String> {
+        let cuda_stream = match stream.as_ref() {
+            DeviceStream::Cuda(s) => s,
+            _ => return Err("KernelBackend::h2d called with non-CUDA stream".into()),
+        };
+        self.submit(copies, true, cuda_stream.inner())
     }
 
-    fn d2h(&self, copies: &[CopyDesc], stream: &Arc<CudaStream>) -> Result<(), String> {
-        self.submit(copies, false, stream)
+    fn d2h(&self, copies: &[CopyDesc], stream: &Arc<DeviceStream>) -> Result<(), String> {
+        let cuda_stream = match stream.as_ref() {
+            DeviceStream::Cuda(s) => s,
+            _ => return Err("KernelBackend::d2h called with non-CUDA stream".into()),
+        };
+        self.submit(copies, false, cuda_stream.inner())
     }
 
     fn name(&self) -> &'static str {

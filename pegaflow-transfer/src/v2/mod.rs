@@ -33,8 +33,9 @@ mod transfer_engine_builder;
 mod utils;
 mod verbs;
 mod worker;
-
-pub use crate::cuda_lib::{CudaDeviceId, CudaDeviceMemory, Device};
+pub use crate::device::{CudaDeviceId, Device};
+#[cfg(feature = "ascend")]
+pub use crate::device::AscendDeviceId;
 pub use api::{
     BarrierTransferRequest, DomainAddress, DomainGroupRouting, GroupTransferRouting, ImmCounter,
     ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle, MemoryRegionRemoteKey,
