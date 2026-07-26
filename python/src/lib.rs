@@ -295,9 +295,10 @@ impl EngineRpcClient {
         let transfer_mode = match transfer_backend {
             "direct" => TransferMode::Direct,
             "kernel" => TransferMode::Kernel,
+            "ascend_direct" => TransferMode::AscendDirect,
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown transfer_backend '{other}' (expected 'direct' or 'kernel')"
+                    "unknown transfer_backend '{other}' (expected 'direct', 'kernel', or 'ascend_direct')"
                 )));
             }
         };

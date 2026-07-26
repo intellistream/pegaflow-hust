@@ -294,7 +294,7 @@ fn build_backend(
         TransferMode::Kernel => {
             #[cfg(feature = "cuda")]
             {
-                if let DeviceContext::Cuda(ref cuda) = ctx {
+                if let DeviceContext::Cuda(cuda) = ctx {
                     let kernel = KernelBackend::new(cuda.inner()).map_err(|e| {
                         EngineError::DeviceInit(format!("kernel backend init failed: {e}"))
                     })?;
@@ -534,13 +534,57 @@ fn process_save_task(
 
     let (copies, total_bytes) = build_copy_descs(layers)?;
 
-    // TODO(ascend): backend.d2h() requires device memory allocated via
-    // aclrtMallocPhysical.  When camem_allocator integration is complete
-    // (see §7.2 方案 A/B), this call will succeed natively.  Until then,
-    // it returns Err(EngineError::Storage("aclrtMemcpyAsync(D2H) failed: 507899")).
-    // No fallback is attempted — the synchronous aclrtMemcpy fallback may
-    // segfault on non-aclrtMallocPhysical memory (ascend.rs:408-415).
-    backend.d2h(&copies, stream).map_err(EngineError::Storage)?;
+    // Ascend: aclrtMemcpyAsync(D2H) requires device memory allocated via
+    // aclrtMallocPhysical (i.e., via camem_allocator from vllm-ascend-hust).
+    // When the default torch_npu expandable_segments allocator is used, D2H
+    // fails with CANN error 507899 ("memory not allocated via
+    // aclrtMallocPhysical").  The synchronous aclrtMemcpy fallback may
+    // segfault on non-DMA memory, so it is NOT attempted by default.
+    //
+    // Two resolutions are available:
+    // 1. (Recommended) Enable camem_allocator: COMPILE_CUSTOM_KERNELS=1 and
+    //    build vllm_ascend_C.  All KV cache tensors will use aclrtMallocPhysical.
+    // 2. (Emergency) Set PEGAFLOW_ASCEND_FORCE_SYNC_D2H=1 to attempt synchronous
+    //    aclrtMemcpy fallback on error 507899.  WARNING: may crash the process
+    //    when memory was allocated by the default expandable_segments allocator.
+    let d2h_result = backend.d2h(&copies, stream);
+    #[cfg(feature = "ascend")]
+    let d2h_result = match d2h_result {
+        Err(ref msg) if msg.contains("507899") => {
+            let force_sync = std::env::var("PEGAFLOW_ASCEND_FORCE_SYNC_D2H")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if force_sync {
+                warn!(
+                    "PEGAFLOW_ASCEND_FORCE_SYNC_D2H=1: attempting synchronous \
+                     aclrtMemcpy fallback after async D2H failure. This may \
+                     segfault if device memory was not allocated via \
+                     aclrtMallocPhysical."
+                );
+                // Retry via synchronous path
+                use crate::device::ascend;
+                for copy in &copies {
+                    if let Err(e) = ascend::memcpy_d2h_sync(copy.host, copy.device, copy.size) {
+                        return Err(EngineError::Storage(format!(
+                            "sync D2H fallback also failed: {e}"
+                        )));
+                    }
+                }
+                stream.synchronize().map_err(|e| {
+                    EngineError::Storage(format!("Failed to synchronize: {e}"))
+                })?;
+                Ok(())
+            } else {
+                Err(format!(
+                    "{msg}. Enable camem_allocator (COMPILE_CUSTOM_KERNELS=1) or set \
+                     PEGAFLOW_ASCEND_FORCE_SYNC_D2H=1 to attempt synchronous fallback \
+                     (WARNING: may segfault)."
+                ))
+            }
+        }
+        other => other,
+    };
+    d2h_result.map_err(EngineError::Storage)?;
 
     // Synchronize the stream.  On Ascend, async copies may fall back to
     // synchronous aclrtMemcpy inside the backend, which can leave the stream

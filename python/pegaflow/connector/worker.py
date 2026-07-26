@@ -270,14 +270,28 @@ class WorkerConnector:
             raise RuntimeError("No KV cache layers were selected for registration")
 
         # Ascend prefill-disaggregation returns KV caches as (k, v) tuples.
-        # Flatten to per-tensor dict: {layer_k: k, layer_v: v}
+        # Following vllm-ascend's _flatten_kv_value pattern: each tensor has
+        # its own backing storage and may be independently allocated (K and V
+        # live in separate allocations on Ascend).
+        # Deduplicate by untyped_storage().data_ptr() — a single NPU allocation
+        # may back multiple layers (tied weights / aliased KV).
         flat_kv_caches: dict[str, torch.Tensor] = {}
+        seen_ptrs: set[int] = set()
         for layer_name, kv_cache in kv_caches.items():
-            if isinstance(kv_cache, tuple):
+            if isinstance(kv_cache, (tuple, list)):
                 for idx, t in enumerate(kv_cache):
-                    flat_kv_caches[f"{layer_name}_{'k' if idx == 0 else 'v'}"] = t
+                    ptr = _safe_data_ptr(t)
+                    if ptr in seen_ptrs or ptr == 0:
+                        continue
+                    seen_ptrs.add(ptr)
+                    suffix = "k" if idx == 0 else "v"
+                    flat_kv_caches[f"{layer_name}_{suffix}"] = t
             else:
-                flat_kv_caches[layer_name] = kv_cache
+                # Single tensor — may still alias another layer's storage
+                ptr = _safe_data_ptr(kv_cache)
+                if ptr not in seen_ptrs and ptr != 0:
+                    seen_ptrs.add(ptr)
+                    flat_kv_caches[layer_name] = kv_cache
         kv_caches = flat_kv_caches
 
         self._registered_layers = list(kv_caches.keys())
@@ -705,6 +719,14 @@ class WorkerConnector:
         self._save_queue.put(SaveTask(metadata=metadata, request_ids=request_ids))
 
     def _save_worker(self) -> None:
+        # Match vllm-ascend's NPU copy-backend pattern: set the device
+        # for this OS thread once before entering the loop, so every
+        # `_device_synchronize()` / gRPC save call targets the correct
+        # NPU device.  On CUDA the driver handles this transparently;
+        # on Ascend each thread must call aclrtSetDevice explicitly.
+        device = getattr(self, "_torch_device", None)
+        if device is not None:
+            _ensure_npu_device_set(device)
         logger.debug("[PegaKVConnector] Save worker thread started")
 
         while True:
@@ -733,6 +755,8 @@ class WorkerConnector:
         logger.debug("[PegaKVConnector] Save worker thread stopped")
 
     def _process_save_batch(self, batch: list[SaveTask]) -> None:
+        # Ensure device is set for this thread (safe + idempotent).
+        _ensure_npu_device_set(self._torch_device)
         saves_by_layer: dict[str, tuple[list[int], list[bytes]]] = {}
         all_request_ids: list[str] = []
 
@@ -812,6 +836,18 @@ class WorkerConnector:
                         "[PegaKVConnector] Save batch failed: %s (continuing without save)",
                         message,
                     )
+                    # Ascend-specific: error 507899 means device tensors were not
+                    # allocated via aclrtMallocPhysical (camem_allocator).  Provide
+                    # a clear diagnostic so users can fix their configuration.
+                    if "507899" in message:
+                        logger.error(
+                            "[PegaKVConnector] D2H memcpy failed with CANN error 507899: "
+                            "device memory is not DMA-capable.  Enable camem_allocator "
+                            "(COMPILE_CUSTOM_KERNELS=1) so KV cache tensors are allocated "
+                            "via aclrtMallocPhysical, or set PEGAFLOW_ASCEND_FORCE_SYNC_D2H=1 "
+                            "to attempt synchronous aclrtMemcpy fallback "
+                            "(WARNING: may segfault on non-DMA memory)."
+                        )
                 else:
                     success = True
                     logger.debug(
@@ -824,6 +860,14 @@ class WorkerConnector:
                     "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
                     e,
                 )
+                # If the exception message suggests a DMA issue, provide the same hint.
+                exc_msg = str(e)
+                if "507899" in exc_msg or "aclrtMemcpy" in exc_msg:
+                    logger.error(
+                        "[PegaKVConnector] Save failure may be caused by non-DMA-capable "
+                        "device memory.  See the CANN error 507899 diagnostic above for "
+                        "resolution steps (camem_allocator)."
+                    )
 
             save_duration = time.perf_counter() - save_start
 
@@ -970,6 +1014,35 @@ def _resolve_ipc_wrapper_factory(device: torch.device):
         f"Unsupported device type '{device.type}'. "
         "PegaFlow requires CUDA or Ascend NPU."
     )
+
+
+def _safe_data_ptr(tensor) -> int:
+    """Return ``data_ptr()`` even when the tensor is a stub/fake.
+
+    Unit tests inject ``FakeTensor`` objects that lack ``untyped_storage()``.
+    Return a unique id via ``id(tensor)`` in that case so dedup still works.
+    """
+    try:
+        storage = tensor.untyped_storage()
+        return storage.data_ptr()
+    except AttributeError:
+        return id(tensor)
+
+
+def _ensure_npu_device_set(device):
+    """Set the NPU device for the calling OS thread if on Ascend.
+
+    On CUDA the driver manages per-thread context automatically via the
+    primary context; on Ascend each thread must explicitly call
+    ``aclrtSetDevice`` before any CANN API.  This matches vllm-ascend's
+    ``NPUDmaCopyBackend._copy_loop`` pattern where
+    ``torch.npu.set_device(self._device)`` is called once at worker
+    thread start.
+
+    Idempotent — safe to call before every batch.
+    """
+    if device is not None and device.type == "npu":
+        torch.npu.set_device(device)
 
 
 def _device_synchronize(device):  # type: ignore[type-arg]

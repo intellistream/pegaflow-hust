@@ -233,6 +233,7 @@ impl Engine for GrpcEngineService {
             let transfer_mode = match req.transfer_mode() {
                 ProtoTransferMode::Direct => pegaflow_core::TransferMode::Direct,
                 ProtoTransferMode::Kernel => pegaflow_core::TransferMode::Kernel,
+                ProtoTransferMode::AscendDirect => pegaflow_core::TransferMode::AscendDirect,
             };
 
             // Validate array lengths are consistent with each other.

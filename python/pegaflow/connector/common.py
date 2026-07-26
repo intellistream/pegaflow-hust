@@ -13,7 +13,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 
 from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pegaflow import EngineRpcClient
+
+if TYPE_CHECKING:
+    from pegaflow.pegaflow import EngineRpcClient
 
 if TYPE_CHECKING:
     from pegaflow.connector.state_manager import ServiceStateManager
@@ -51,7 +53,7 @@ class ConnectorContext:
     world_size: int
     tp_rank: int | None
     device_id: int | None
-    engine_client: EngineRpcClient
+    engine_client: "EngineRpcClient"
     state_manager: "ServiceStateManager"
     is_mla: bool = False
     transfer_backend: str = "direct"
@@ -204,6 +206,7 @@ def derive_namespace(
     dcp_world_size: int = 1,
     pcp_world_size: int = 1,
     cross_layer_blocks: bool = False,
+    override: str | None = None,
 ) -> str:
     """
     Derive namespace for storage isolation.
@@ -219,7 +222,13 @@ def derive_namespace(
     - `mla_layer_split_kv_cache`: MLA layer-split registration shards each
       block's slots across ranks, a different per-block layout than the
       default full-slot registration.
+
+    When `override` is non-None, it is returned directly — useful for manual
+    namespace isolation in benchmarks and tests.
     """
+    if override is not None:
+        return override
+
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
     additional_config = getattr(vllm_config, "additional_config", None) or {}
@@ -253,17 +262,45 @@ def detect_mla(vllm_config) -> bool:
 _TRANSFER_BACKENDS = ("direct", "kernel", "ascend_direct")
 
 
-def resolve_transfer_backend(is_mla: bool, override: str | None) -> str:
+def _is_npu_available() -> bool:
+    """Detect whether Ascend NPU hardware is available at runtime.
+
+    Returns True when ``torch.npu`` is importable and reports at least one
+    device; False otherwise (including when torch is not installed).
+    """
+    try:
+        import torch
+
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except ImportError:
+        return False
+
+
+def resolve_transfer_backend(
+    is_mla: bool,
+    override: str | None,
+    is_npu: bool | None = None,
+) -> str:
     """Pick the engine's H2D/D2H backend for this model.
 
     MLA models save/load many small, highly fragmented slots where the kernel
     backend's single launch beats one copy per slot; everything else
-    defaults to direct (best bandwidth for few/large transfers). A non-empty
-    `override` (from `pegaflow.transfer_backend`) wins, and an unknown value is
-    rejected rather than silently falling back.
+    defaults to direct (best bandwidth for few/large transfers).  A non-empty
+    `override` (from `pegaflow.transfer_backend`) always wins, and an unknown
+    value is rejected rather than silently falling back.
+
+    On Ascend NPU, the `kernel` backend is **not** available (CUDA-only), so
+    MLA defaults to ``"direct"`` on NPU (mapped to ``AscendMemcpyBackend``
+    by the engine).  ``is_npu`` is auto-detected via ``torch.npu`` when not
+    explicitly provided.
     """
+    if is_npu is None:
+        is_npu = _is_npu_available()
+
     if override is None:
-        return "kernel" if is_mla else "direct"
+        if is_mla:
+            return "direct" if is_npu else "kernel"
+        return "direct"
     normalized = override.strip().lower()
     if normalized not in _TRANSFER_BACKENDS:
         allowed = ", ".join(_TRANSFER_BACKENDS)

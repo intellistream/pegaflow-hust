@@ -29,6 +29,14 @@ type aclrtEvent = *mut c_void;
 #[allow(non_camel_case_types, dead_code)]
 type aclrtContext = *mut c_void;
 
+/// Opaque handle for aclrtMemcpyAttr (used by aclrtMemcpyBatchAsync).
+/// Always passed as NULL for pegaflow's usage — we never use attributes.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct AclrtMemcpyAttr {
+    _private: u8,
+}
+
 /// Success return code for all CANN ACL APIs.
 pub(crate) const ACL_ERROR_NONE: i32 = 0;
 
@@ -90,6 +98,23 @@ unsafe extern "C" {
     /// Free pinned host memory.
     fn aclrtFreeHost(ptr: *mut c_void) -> aclError;
 
+    /// Batched asynchronous memory copy (CANN 8.5+).
+    /// Transfers multiple discontiguous regions in a single call,
+    /// matching the vllm-ascend ``swap_blocks_batch`` pattern.
+    /// `kind`: 1 = HOST_TO_DEVICE, 2 = DEVICE_TO_HOST.
+    fn aclrtMemcpyBatchAsync(
+        dst: *const *mut c_void,
+        dst_max: *const usize,
+        src: *const *const c_void,
+        count: *const usize,
+        n: u32,
+        attr: *const AclrtMemcpyAttr,
+        attrs_index: *const i32,
+        num_attrs: u32,
+        fail_index: *mut u32,
+        stream: aclrtStream,
+    ) -> aclError;
+
     /// Get C_ANN runtime version.
     fn aclrtGetVersion(major: *mut i32, minor: *mut i32, patch: *mut i32) -> aclError;
 
@@ -109,40 +134,6 @@ unsafe extern "C" {
     /// all preceding work in the event's stream has completed).
     fn aclrtSynchronizeEvent(event: aclrtEvent) -> aclError;
 
-    // -- Batch memcpy API (CANN 8.5+) ----------------------------------
-
-    fn aclrtMemcpyBatchAsync(
-        dsts: *mut *mut c_void,
-        dest_maxs: *mut usize,
-        srcs: *mut *mut c_void,
-        sizes: *mut usize,
-        num_batches: usize,
-        attrs: *const AclrtMemcpyBatchAttr,
-        attr_indexes: *mut usize,
-        num_attrs: usize,
-        fail_index: *mut usize,
-        stream: aclrtStream,
-    ) -> aclError;
-}
-
-/// Location descriptor for batch memcpy src/dst.
-/// Matches `AclrtMemLocation` in acl_rt.h.
-#[repr(C)]
-struct AclrtMemLocation {
-    id: u32,
-    _type: i32,
-}
-
-/// Attribute for a batch memcpy operation.
-/// Matches `AclrtMemcpyBatchAttr` in acl_rt.h:
-///   AclrtMemLocation dstLoc;   // offset 0
-///   AclrtMemLocation srcLoc;   // offset 8
-///   uint8_t rsv[16];           // offset 16
-#[repr(C)]
-struct AclrtMemcpyBatchAttr {
-    dst_loc: AclrtMemLocation,
-    src_loc: AclrtMemLocation,
-    _rsv: [u8; 16],
 }
 
 // ---------------------------------------------------------------------------
@@ -604,110 +595,127 @@ pub fn memcpy_d2h_async(
     Ok(())
 }
 
-// -- Batch memcpy wrappers (CANN 8.5+) -----------------------------------
+// ---------------------------------------------------------------------------
+// Ascend Batched Memcpy (CANN 8.5+)
+// ---------------------------------------------------------------------------
 
-/// Submit a batch of H2D copies via a single `aclrtMemcpyBatchAsync` call.
+/// One copy descriptor for `memcpy_batch_async`.
+#[derive(Clone, Copy)]
+pub(crate) struct BatchCopyDesc {
+    pub dst: u64,
+    pub dst_max: usize,
+    pub src: u64,
+    pub size: usize,
+}
+
+/// Enqueue a batched host→device copy on the given stream.
 ///
-/// This avoids the TS queue overflow (507001) caused by submitting hundreds
-/// or thousands of individual `aclrtMemcpyAsync` calls on one stream.
-/// All copies share a single TS slot.
-pub fn memcpy_batch_h2d(
-    copies: &[(u64, *mut u8, usize)],
-    device_id: i32,
+/// Uses `aclrtMemcpyBatchAsync` when available (CANN 8.5+), falling back
+/// to per-entry `aclrtMemcpyAsync` on older runtimes.  This matches the
+/// vllm-ascend ``swap_blocks_batch`` pattern: one kernel launch for the
+/// entire batch instead of per-block DMA overhead.
+pub fn memcpy_h2d_batch_async(
+    copies: &[BatchCopyDesc],
     stream: &AscendDeviceStream,
 ) -> Result<(), String> {
-    ensure_acl_initialized()?;
-    let n = copies.len();
-    if n == 0 {
+    if copies.is_empty() {
         return Ok(());
     }
+    ensure_acl_initialized()?;
 
-    let mut dsts: Vec<u64> = Vec::with_capacity(n);
-    let mut srcs: Vec<u64> = Vec::with_capacity(n);
-    let mut sizes: Vec<u64> = Vec::with_capacity(n);
-
-    for &(dev, host, size) in copies {
-        dsts.push(dev);
-        srcs.push(host as u64);
-        sizes.push(size as u64);
-    }
-
-    unsafe extern "C" {
-        fn pega_aclrt_memcpy_batch_h2d(
-            dsts: *const u64,
-            srcs: *const u64,
-            sizes: *const u64,
-            num_batches: u64,
-            device_id: i32,
-            stream: aclrtStream,
-        ) -> aclError;
-    }
+    // Use the batch API — single aclrtMemcpyBatchAsync call.
+    let n = copies.len() as u32;
+    let dst_ptrs: Vec<*mut c_void> = copies.iter().map(|c| c.dst as *mut c_void).collect();
+    let dst_maxs: Vec<usize> = copies.iter().map(|c| c.dst_max).collect();
+    let src_ptrs: Vec<*const c_void> = copies.iter().map(|c| c.src as *const c_void).collect();
+    let sizes: Vec<usize> = copies.iter().map(|c| c.size).collect();
 
     let ret = unsafe {
-        pega_aclrt_memcpy_batch_h2d(
-            dsts.as_ptr(),
-            srcs.as_ptr(),
+        aclrtMemcpyBatchAsync(
+            dst_ptrs.as_ptr(),
+            dst_maxs.as_ptr(),
+            src_ptrs.as_ptr(),
             sizes.as_ptr(),
-            n as u64,
-            device_id,
+            n,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
             stream.stream,
         )
     };
+
     if ret != ACL_ERROR_NONE {
-        return Err(format!(
-            "aclrtMemcpyBatchAsync(H2D) failed: error {ret}, num_batches={n}"
-        ));
+        let desc = acl_error_description(ret);
+        // Fall back to per-copy aclrtMemcpyAsync for non-DMA-memory errors
+        if ret == ACL_ERROR_DMA_NOT_SUPPORTED {
+            return Err(format!(
+                "aclrtMemcpyBatchAsync(H2D) failed: error {ret} ({desc}). \
+                 Enable camem_allocator (COMPILE_CUSTOM_KERNELS=1) for DMA-capable \
+                 KV cache allocations."
+            ));
+        }
+        // For other errors, try per-copy fallback
+        log::warn!(
+            "aclrtMemcpyBatchAsync(H2D) failed: error {ret} ({desc}) — \
+             falling back to per-copy aclrtMemcpyAsync"
+        );
+        for copy in copies {
+            memcpy_h2d_async(copy.dst, copy.src as *const u8, copy.size, stream)?;
+        }
     }
     Ok(())
 }
 
-/// Submit a batch of D2H copies via a single `aclrtMemcpyBatchAsync` call.
-pub fn memcpy_batch_d2h(
-    copies: &[(u64, *mut u8, usize)],
-    device_id: i32,
+/// Enqueue a batched device→host copy on the given stream.
+///
+/// Mirrors `memcpy_h2d_batch_async` for the reverse direction.
+pub fn memcpy_d2h_batch_async(
+    copies: &[BatchCopyDesc],
     stream: &AscendDeviceStream,
 ) -> Result<(), String> {
-    ensure_acl_initialized()?;
-    let n = copies.len();
-    if n == 0 {
+    if copies.is_empty() {
         return Ok(());
     }
+    ensure_acl_initialized()?;
 
-    let mut srcs: Vec<u64> = Vec::with_capacity(n);
-    let mut dsts: Vec<u64> = Vec::with_capacity(n);
-    let mut sizes: Vec<u64> = Vec::with_capacity(n);
-
-    for &(dev, host, size) in copies {
-        srcs.push(dev);
-        dsts.push(host as u64);
-        sizes.push(size as u64);
-    }
-
-    unsafe extern "C" {
-        fn pega_aclrt_memcpy_batch_d2h(
-            srcs: *const u64,
-            dsts: *const u64,
-            sizes: *const u64,
-            num_batches: u64,
-            device_id: i32,
-            stream: aclrtStream,
-        ) -> aclError;
-    }
+    let n = copies.len() as u32;
+    let dst_ptrs: Vec<*mut c_void> = copies.iter().map(|c| c.dst as *mut c_void).collect();
+    let dst_maxs: Vec<usize> = copies.iter().map(|c| c.dst_max).collect();
+    let src_ptrs: Vec<*const c_void> = copies.iter().map(|c| c.src as *const c_void).collect();
+    let sizes: Vec<usize> = copies.iter().map(|c| c.size).collect();
 
     let ret = unsafe {
-        pega_aclrt_memcpy_batch_d2h(
-            srcs.as_ptr(),
-            dsts.as_ptr(),
+        aclrtMemcpyBatchAsync(
+            dst_ptrs.as_ptr(),
+            dst_maxs.as_ptr(),
+            src_ptrs.as_ptr(),
             sizes.as_ptr(),
-            n as u64,
-            device_id,
+            n,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
             stream.stream,
         )
     };
+
     if ret != ACL_ERROR_NONE {
-        return Err(format!(
-            "aclrtMemcpyBatchAsync(D2H) failed: error {ret}, num_batches={n}"
-        ));
+        let desc = acl_error_description(ret);
+        if ret == ACL_ERROR_DMA_NOT_SUPPORTED {
+            return Err(format!(
+                "aclrtMemcpyBatchAsync(D2H) failed: error {ret} ({desc}). \
+                 Enable camem_allocator (COMPILE_CUSTOM_KERNELS=1) for DMA-capable \
+                 KV cache allocations."
+            ));
+        }
+        log::warn!(
+            "aclrtMemcpyBatchAsync(D2H) failed: error {ret} ({desc}) — \
+             falling back to per-copy aclrtMemcpyAsync"
+        );
+        for copy in copies {
+            memcpy_d2h_async(copy.dst as *mut u8, copy.src, copy.size, stream)?;
+        }
     }
     Ok(())
 }

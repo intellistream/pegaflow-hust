@@ -20,7 +20,7 @@ impl CudaDevice {
         let ctx = CudaContext::new(device_id as usize)
             .map_err(|e| format!("CudaContext::new(device {device_id}) failed: {e:?}"))?;
         Ok(Self {
-            ctx: Arc::new(ctx),
+            ctx,
             device_id,
         })
     }

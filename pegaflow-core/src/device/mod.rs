@@ -75,28 +75,66 @@ impl DeviceStream {
 
     /// Create a new device-side allocation of `len` zeros of type `T`.
     /// Returns an opaque handle that can be used with backend-specific APIs.
-    #[cfg(feature = "cuda")]
-    pub fn alloc_zeros<T: 'static + Default + Clone + bytemuck::Pod>(
+    ///
+    /// On Ascend, this uses `aclrtMalloc` + a synchronous `aclrtMemcpy` zero
+    /// fill, which is less efficient than `cuMemAlloc` zero-init.  Callers
+    /// that do not need zeroed memory should pre-allocate and reuse buffers
+    /// instead of relying on `alloc_zeros`.
+    #[cfg(any(feature = "cuda", feature = "ascend"))]
+    #[allow(unused)]
+    pub fn alloc_zeros<T: 'static + Default + Clone>(
         &self,
         len: usize,
     ) -> Result<Box<dyn std::any::Any + Send>, String> {
-        use cudarc::driver::CudaSlice;
-        match self {
-            DeviceStream::Cuda(s) => {
-                // SAFETY: the CudaSlice allocation is isolated to CUDA memory.
-                unsafe {
-                    let slice: CudaSlice<T> = s
-                        .stream
-                        .alloc_zeros::<T>(len)
-                        .map_err(|e| format!("alloc_zeros failed: {e:?}"))?;
-                    Ok(Box::new(slice))
-                }
-            }
-            #[cfg(feature = "ascend")]
-            DeviceStream::Ascend(_) => {
-                Err("alloc_zeros: Ascend backend does not support scratch allocations".into())
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::CudaSlice;
+            if let DeviceStream::Cuda(s) = self {
+                // SAFETY: CudaSlice allocation is isolated to CUDA memory.
+                // cudarc requires bytemuck::Pod, which is transitively
+                // available when the "cuda" feature is active.
+                let slice: CudaSlice<u8> = unsafe {
+                    s.stream
+                        .alloc_zeros::<u8>(len * std::mem::size_of::<T>())
+                        .map_err(|e| format!("alloc_zeros failed: {e:?}"))?
+                };
+                return Ok(Box::new(slice));
             }
         }
+        #[cfg(feature = "ascend")]
+        {
+            if let DeviceStream::Ascend(_) = self {
+                use crate::device::ascend;
+                use std::alloc::{Layout, alloc, dealloc};
+
+                let size = len.checked_mul(std::mem::size_of::<T>())
+                    .ok_or_else(|| "alloc_zeros: size overflow".to_string())?;
+                if size == 0 {
+                    return Err("alloc_zeros: size must be > 0".into());
+                }
+                let dev_ptr = ascend::malloc_device(size, 0)
+                    .map_err(|e| format!("alloc_zeros(Ascend): aclrtMalloc failed: {e}"))?;
+
+                // Zero-fill via host-side buffer -> sync H2D
+                let host_layout = Layout::array::<T>(len)
+                    .map_err(|e| format!("alloc_zeros: layout error: {e}"))?;
+                let host_ptr = unsafe { alloc(host_layout) };
+                if host_ptr.is_null() {
+                    ascend::free_device(dev_ptr).ok();
+                    return Err("alloc_zeros: host alloc failed".into());
+                }
+                unsafe { std::ptr::write_bytes(host_ptr, 0, size) };
+                let result = ascend::memcpy_h2d_sync(dev_ptr, host_ptr as *const u8, size);
+                unsafe { dealloc(host_ptr, host_layout) };
+                if let Err(e) = result {
+                    ascend::free_device(dev_ptr).ok();
+                    return Err(format!("alloc_zeros(Ascend): zero-fill H2D failed: {e}"));
+                }
+
+                return Ok(Box::new(dev_ptr));
+            }
+        }
+        Err("alloc_zeros: no device backend available".into())
     }
 
     /// Record an event on this stream. Returns an opaque event handle.

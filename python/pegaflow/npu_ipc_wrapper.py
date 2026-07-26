@@ -12,6 +12,7 @@ The IPC primitives are implemented via two paths:
 """
 
 import ctypes
+import os
 import threading
 
 import torch
@@ -207,13 +208,33 @@ class NpuIPCWrapper:
 
         # Use PyTorch's built-in NPU IPC — same pattern as CudaIPCWrapper
         # which uses storage._share_cuda_().
-        self._handle: tuple = storage._share_npu_()
+        # _share_npu_() returns a tuple whose [0] is the LOCAL device
+        # index (remapped by ASCEND_RT_VISIBLE_DEVICES).  The server calls
+        # _new_shared_npu(handle) which reads handle[0] directly — if we
+        # don't remap it to the global physical device, the server will
+        # import the storage on the wrong NPU.
+        handle = storage._share_npu_()
+        local_device = tensor.device.index
+        global_device = local_device
+        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+        if visible:
+            slots = [s.strip() for s in visible.split(",") if s.strip()]
+            try:
+                global_device = int(slots[local_device])
+            except (IndexError, ValueError):
+                pass
+        # Replace handle[0] with the global physical device ID.
+        if global_device != local_device:
+            handle = list(handle)
+            handle[0] = global_device
+            handle = tuple(handle)
+        self._handle: tuple = handle
 
         self.dtype = tensor.dtype
         self.shape = tensor.shape
         self.stride = tensor.stride()
         self.storage_offset = tensor.storage_offset()
-        self.device_index = tensor.device.index
+        self.device_index = global_device
 
     def to_tensor(self) -> torch.Tensor:
         """Reconstruct a real torch.Tensor from the NPU IPC handle.

@@ -11,6 +11,8 @@ message ResponseStatus {
 enum TransferMode {
   TRANSFER_MODE_DIRECT = 0;
   TRANSFER_MODE_KERNEL = 1;
+  // Ascend NPU DMA copy-engine backend (aclrtMemcpyBatchAsync).
+  TRANSFER_MODE_ASCEND_DIRECT = 2;
 }
 
 // Batch registration request for all layers on a GPU (reduces N RPCs to 1).
