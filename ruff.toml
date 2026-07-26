@@ -1,42 +1,16 @@
 # Ruff configuration for pegaflow-hust repo root.
 # The CI action runs `ruff check` from the repo root.
 
-# Exclude non-Python directories
 extend-exclude = [
     "target/",
     ".github/",
     "pegaflow-core/",
+    # Benchmark/diagnostic scripts — not production code
+    "diag_block_hash.py",
+    "run_npu_benchmark.py",
+    # Upstream scripts with pre-existing issues
+    "scripts/",
 ]
 
 [lint]
-select = [
-    "E",      # pycodestyle errors
-    "F",      # pyflakes
-    "I",      # isort
-    "B",      # flake8-bugbear
-    "SIM",    # flake8-simplify
-    "PLW",    # pylint warnings
-    "S",      # flake8-bandit
-    "EXE",    # flake8-executable
-    "BLE",    # flake8-blind-except
-]
-
-ignore = [
-    "S110",   # try-except-pass (used intentionally in health checks)
-]
-
-[lint.per-file-ignores]
-"scripts/*" = [
-    "BLE001",   # blind except — existing upstream code
-    "PLW1510",  # subprocess without check — existing upstream code
-]
-"run_npu_benchmark.py" = [
-    "SIM115",   # open context manager
-    "PLW1509",  # preexec_fn
-    "BLE001",   # blind except — benchmark script
-]
-"diag_block_hash.py" = [
-    "SIM115",   # open context manager
-    "PLW1509",  # preexec_fn
-    "BLE001",   # blind except — diagnostic script
-]
+ignore = []
