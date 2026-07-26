@@ -13,10 +13,9 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import time
-import uuid
 import urllib.request
+import uuid
 from pathlib import Path
 
 MODEL_PATH = "/workspace/HUST/models/models/Qwen--Qwen2.5-0.5B-Instruct/snapshots/master"
@@ -127,7 +126,7 @@ def send_completion(prompt, max_tokens=16):
 def check_server_cache():
     """Check server /metrics for cache stats."""
     try:
-        resp = urllib.request.urlopen(f"http://127.0.0.1:9091/metrics", timeout=5)
+        resp = urllib.request.urlopen("http://127.0.0.1:9091/metrics", timeout=5)
         # Look for any cache-related metrics
         body = resp.read().decode()
         for line in body.split("\n"):
@@ -178,11 +177,12 @@ def main():
         print("\nPhase 2: Query directly via EngineRpcClient")
         print("-" * 40)
 
-        from pegaflow.pegaflow import EngineRpcClient, QueryReady, QueryLoading
+        import hashlib
+        import pickle
+
         import torch
         from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
-        import pickle
-        import hashlib
+        from pegaflow.pegaflow import EngineRpcClient, QueryLoading, QueryReady
 
         client = EngineRpcClient(f"http://127.0.0.1:{SERVER_PORT}")
         ok, msg = client.health()
@@ -248,7 +248,7 @@ def main():
                 elif isinstance(result, QueryLoading):
                     time.sleep(0.2)
             else:
-                print(f"  Query still loading after 15 attempts")
+                print("  Query still loading after 15 attempts")
 
             # Also try querying with just the first hash
             first_hash = block_hashes[:1]

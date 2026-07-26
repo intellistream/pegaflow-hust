@@ -16,12 +16,12 @@ Usage:
   python3 scripts/diagnose_fork_socket.py [fork|spawn|spawn-fork]
 """
 
+import multiprocessing
 import os
 import socket
+import subprocess
 import sys
 import time
-import subprocess
-import multiprocessing
 
 
 def create_server_socket(host: str, port: int) -> socket.socket:

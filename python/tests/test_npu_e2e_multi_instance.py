@@ -41,6 +41,7 @@ def _make_registration_params(device: str = "npu:0"):
     values cause 'registered memory too small' errors server-side.
     """
     import torch
+
     from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
 
     num_blocks = 16

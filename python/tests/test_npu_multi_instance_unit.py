@@ -18,11 +18,8 @@ They validate:
 
 import os
 import pickle
-import unittest.mock as mock
-from contextlib import contextmanager
 
 import pytest
-
 
 # =============================================================================
 # Helpers — zero-dependency inline copies for isolation testing
@@ -447,7 +444,7 @@ class TestNpuIPCWrapperMultiKey:
         restored_list = pickle.loads(batch_data)
 
         assert len(restored_list) == len(originals)
-        for i, (orig, rest) in enumerate(zip(originals, restored_list)):
+        for i, (orig, rest) in enumerate(zip(originals, restored_list, strict=False)):
             assert rest == orig, f"wrapper {i} mismatch"
             assert rest.device_index == i, f"wrapper {i} device_index wrong"
 

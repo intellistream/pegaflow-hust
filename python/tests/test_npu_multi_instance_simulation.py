@@ -13,13 +13,13 @@ Requires:
 - At least 1 Ascend NPU device
 """
 
+import contextlib
 import hashlib
 import os
 import pickle
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 import torch
@@ -52,12 +52,14 @@ def _require_camem():
         pytest.skip("camem_allocator not available (vllm_ascend_C not built)")
 
 
-def _kv_cache_tensor(num_blocks, block_size, dtype=torch.float16, device="npu:0"):
+def _kv_cache_tensor(num_blocks, block_size, dtype=None, device="npu:0"):
     """Allocate a simulated KV cache tensor via camem_allocator.
 
     Returns a tensor with layout [num_blocks, block_size] that is
     DMA-capable (allocated via aclrtMallocPhysical).
     """
+    if dtype is None:
+        dtype = torch.half
     try:
         from vllm_ascend.device_allocator.camem import CaMemAllocator
         allocator = CaMemAllocator.get_instance()
@@ -87,8 +89,8 @@ class TestSaveLoadSameInstance:
         """Instance A saves blocks, then loads them back — data matches."""
         _require_server()
         _require_camem()
-        from pegaflow.pegaflow import EngineRpcClient
         from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
+        from pegaflow.pegaflow import EngineRpcClient
 
         client = EngineRpcClient()
         iid = f"test-{uuid.uuid4().hex[:8]}"
@@ -96,7 +98,7 @@ class TestSaveLoadSameInstance:
 
         num_blocks = 8
         block_tokens = 64
-        dtype = torch.float16
+        dtype = torch.half
 
         # Allocate DMA-capable KV cache tensor (single layer to avoid
         # write-pipeline stall when not all registered layers are saved)
@@ -144,9 +146,9 @@ class TestSaveLoadSameInstance:
             # Query — blocks may still be in the write pipeline.
             # Retry with backoff until they appear in the read cache
             # (matching vllm-ascend's query retry pattern).
-            from pegaflow.pegaflow import QueryReady, QueryLoading
+            from pegaflow.pegaflow import QueryReady
             result = None
-            for attempt in range(20):
+            for _attempt in range(20):
                 result = client.query_prefetch(iid, block_hashes, "req-0")
                 if isinstance(result, QueryReady) and result.num_hit_blocks == num_blocks:
                     break
@@ -174,8 +176,8 @@ class TestCrossInstanceSaveLoad:
         """Full cross-instance pipeline: save from A, load on B."""
         _require_server()
         _require_camem()
-        from pegaflow.pegaflow import EngineRpcClient
         from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
+        from pegaflow.pegaflow import EngineRpcClient
 
         client = EngineRpcClient()
         ns = "test-cross-instance"
@@ -185,7 +187,7 @@ class TestCrossInstanceSaveLoad:
 
         # ── Instance A: Produce and save KV cache ──
         iid_a = f"inst-a-{uuid.uuid4().hex[:8]}"
-        k_a = _kv_cache_tensor(num_blocks, block_tokens, torch.float16, "npu:0")
+        k_a = _kv_cache_tensor(num_blocks, block_tokens, torch.half, "npu:0")
         for b in range(num_blocks):
             k_a[b].fill_(b * 0.1)
         torch.npu.synchronize()
@@ -208,7 +210,7 @@ class TestCrossInstanceSaveLoad:
                 transfer_backend="ascend_direct",
                 page_first=False,
             )
-            assert ok, f"Register A failed"
+            assert ok, "Register A failed"
 
             # Save from instance A
             ok, msg = client.save(
@@ -223,7 +225,7 @@ class TestCrossInstanceSaveLoad:
 
             # ── Instance B: Register, query, and load ──
             iid_b = f"inst-b-{uuid.uuid4().hex[:8]}"
-            k_b = _kv_cache_tensor(num_blocks, block_tokens, torch.float16, "npu:0")
+            k_b = _kv_cache_tensor(num_blocks, block_tokens, torch.half, "npu:0")
             wrapper_b = NpuIPCWrapper(k_b)
 
             try:
@@ -239,11 +241,11 @@ class TestCrossInstanceSaveLoad:
                     transfer_backend="ascend_direct",
                     page_first=False,
                 )
-                assert ok, f"Register B failed"
+                assert ok, "Register B failed"
 
                 # Query — should hit A's saved blocks
                 result = client.query_prefetch(iid_b, block_hashes, "req-1")
-                from pegaflow.pegaflow import QueryReady, QueryLoading
+                from pegaflow.pegaflow import QueryLoading, QueryReady
 
                 if isinstance(result, QueryLoading):
                     # Blocks still being prefetched — poll a few times
@@ -258,7 +260,7 @@ class TestCrossInstanceSaveLoad:
                 )
                 # Should have at least some hits from A's saved data
                 assert result.num_hit_blocks > 0, (
-                    f"Cross-instance cache miss: expected hits from instance A"
+                    "Cross-instance cache miss: expected hits from instance A"
                 )
                 print(f"  Cross-instance hits: {result.num_hit_blocks}/{num_blocks} blocks")
 
@@ -279,8 +281,8 @@ class TestConcurrentMultiInstance:
     def test_concurrent_saves(self):
         """4 instances save unique data concurrently (standard alloc)."""
         _require_server()
-        from pegaflow.pegaflow import EngineRpcClient
         from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
+        from pegaflow.pegaflow import EngineRpcClient
 
         num_instances = 4
         num_blocks = 4
@@ -307,7 +309,7 @@ class TestConcurrentMultiInstance:
                 iid = f"conc-{instance_idx}-{uuid.uuid4().hex[:6]}"
                 try:
                     k = torch.zeros(num_blocks, block_tokens,
-                                     dtype=torch.float16, device="npu:0")
+                                     dtype=torch.half, device="npu:0")
                     val = (instance_idx + 1) * 0.5
                     k.fill_(val)
                     torch.npu.synchronize()
@@ -340,10 +342,8 @@ class TestConcurrentMultiInstance:
                 except Exception as e:
                     errors.append(f"Instance {instance_idx}: {e}")
                 finally:
-                    try:
+                    with contextlib.suppress(Exception):
                         client.unregister_context(iid)
-                    except Exception:
-                        pass
 
             threads = [threading.Thread(target=instance_worker, args=(i,))
                        for i in range(num_instances)]
@@ -372,12 +372,12 @@ class TestInstanceIsolation:
     def test_different_namespace_no_cross_hits(self):
         """Block saved in namespace A is NOT visible in namespace B."""
         _require_server()
-        from pegaflow.pegaflow import EngineRpcClient
         from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
+        from pegaflow.pegaflow import EngineRpcClient
 
         client = EngineRpcClient()
         num_blocks = 4
-        k = torch.zeros(num_blocks, 64, dtype=torch.float16, device="npu:0")
+        k = torch.zeros(num_blocks, 64, dtype=torch.half, device="npu:0")
         k.fill_(3.14)
         torch.npu.synchronize()
         wrapper = NpuIPCWrapper(k)
@@ -440,15 +440,15 @@ class TestSessionLifecycle:
     def test_lifecycle_data_persists_across_unregister(self):
         """After unregister+re-register with same namespace, saved data persists."""
         _require_server()
-        from pegaflow.pegaflow import EngineRpcClient
         from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
+        from pegaflow.pegaflow import EngineRpcClient
 
         client = EngineRpcClient()
         iid = f"life-{uuid.uuid4().hex[:8]}"
         ns = "test-lifecycle"
         num_blocks = 2
 
-        k = torch.zeros(num_blocks, 64, dtype=torch.float16, device="npu:0")
+        k = torch.zeros(num_blocks, 64, dtype=torch.half, device="npu:0")
         k.fill_(1.0)
         torch.npu.synchronize()
         w = NpuIPCWrapper(k)
@@ -476,7 +476,7 @@ class TestSessionLifecycle:
 
         # Phase 2: Unregister + Phase 3: Re-register
         client.unregister_context(iid)
-        k2 = torch.zeros(num_blocks, 64, dtype=torch.float16, device="npu:0")
+        k2 = torch.zeros(num_blocks, 64, dtype=torch.half, device="npu:0")
         w2 = NpuIPCWrapper(k2)
         ok, _ = client.register_context_batch(
             iid, ns,

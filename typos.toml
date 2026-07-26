@@ -5,3 +5,5 @@ consts = "consts"
 CANN = "CANN"
 # Currency of Kyrgyzstan and Uzbekistan
 Som = "Som"
+# Bash variable in benchmark scripts (short for SAVE)
+SAV = "SAV"

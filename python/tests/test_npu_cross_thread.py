@@ -233,6 +233,7 @@ class TestIPCWrapperMultiDevice:
         import pickle
 
         import torch
+
         from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
 
         wrappers = []
@@ -247,7 +248,7 @@ class TestIPCWrapperMultiDevice:
         data = pickle.dumps(wrappers)
         restored = pickle.loads(data)
 
-        for i, (orig, rest) in enumerate(zip(wrappers, restored)):
+        for i, (_orig, rest) in enumerate(zip(wrappers, restored, strict=False)):
             assert rest.device_index == i, (
                 f"wrapper {i}: expected device_index {i}, got {rest.device_index}"
             )
@@ -258,6 +259,7 @@ class TestIPCWrapperMultiDevice:
         import pickle
 
         import torch
+
         from pegaflow.npu_ipc_wrapper import NpuIPCWrapper
 
         device = torch.device("npu:1")

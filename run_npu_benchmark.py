@@ -209,7 +209,7 @@ def main():
     print("  PegaFlow NPU Benchmark — 7B Model + Long System Prompt")
     print(f"  Model: Qwen2.5-7B-Instruct | Requests: {num_requests}")
     print(f"  System prompt: ~{len(SYSTEM_PROMPT.split())} words (~3500 tokens)")
-    print(f"  PYTHONHASHSEED=0 (deterministic cross-instance block hashes)")
+    print("  PYTHONHASHSEED=0 (deterministic cross-instance block hashes)")
     print("=" * 65)
 
     server = start_server()
@@ -281,7 +281,7 @@ def main():
         if len(results_b) > 0 and len(results_c) > 0:
             b0 = results_b[0]["ttft_ms"]
             c0 = results_c[0]["ttft_ms"]
-            print(f"\n  First request TTFT (cold for both):")
+            print("\n  First request TTFT (cold for both):")
             print(f"    Shared B[0]:   {b0:.0f}ms")
             print(f"    Isolated C[0]: {c0:.0f}ms")
             if b0 > 0 and c0 > 0:
@@ -289,7 +289,7 @@ def main():
                 print(f"    Reduction:     {r:+.0f}ms ({r / c0 * 100:+.1f}%)")
 
         # Server diagnostics
-        print(f"\n  --- Server diagnostics ---")
+        print("\n  --- Server diagnostics ---")
         server_log = LOG_DIR / "server.log"
         if server_log.exists():
             content = server_log.read_text()

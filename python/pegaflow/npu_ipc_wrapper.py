@@ -11,6 +11,7 @@ The IPC primitives are implemented via two paths:
 2. ctypes fallback against ``libascendcl.so`` — always available.
 """
 
+import contextlib
 import ctypes
 import os
 import threading
@@ -219,10 +220,8 @@ class NpuIPCWrapper:
         visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
         if visible:
             slots = [s.strip() for s in visible.split(",") if s.strip()]
-            try:
+            with contextlib.suppress(IndexError, ValueError):
                 global_device = int(slots[local_device])
-            except (IndexError, ValueError):
-                pass
         # Replace handle[0] with the global physical device ID.
         if global_device != local_device:
             handle = list(handle)
