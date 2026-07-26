@@ -9,7 +9,6 @@ path = "src/bin/dma_stress.rs"
 required-features = ["ascend"]
 
 [build-dependencies]
-cc = "1"
 
 [lints]
 workspace = true

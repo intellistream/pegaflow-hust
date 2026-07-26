@@ -729,8 +729,6 @@ def camem_kv_cache_allocator(npu_available):
         # camem_allocator not available — standard NPU allocations will fail
         # D2H with error 507899.  Tests using this fixture should check
         # result and skip save/load portions.
-        import torch
-
         logger = logging.getLogger(__name__)
         logger.warning(
             "camem_allocator (vllm_ascend_C) not available — "

@@ -1,20 +1,6 @@
 fn main() {
     #[cfg(feature = "ascend")]
     {
-        // Compile C wrapper for aclrtMemcpyBatchAsync.
-        // The include path covers CANN 8.5.1 and 9.1.0; cc silently skips
-        // directories that do not exist.
-        let mut build = cc::Build::new();
-        build.file("src/device/ascend_batch.c");
-        for inc in &[
-            "/usr/local/Ascend/cann-8.5.1/aarch64-linux/include",
-            "/usr/local/Ascend/cann-9.1.0/aarch64-linux/include",
-            "/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/include",
-        ] {
-            build.include(inc);
-        }
-        build.compile("ascend_batch");
-
         // Resolve Ascend CANN library paths dynamically from environment.
         // Priority: ASCEND_HOME_PATH > ASCEND_HOME > hardcoded fallbacks.
         let ascend_home = std::env::var("ASCEND_HOME_PATH")
@@ -48,7 +34,6 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=ascendcl");
 
         println!("cargo:rerun-if-changed=build.rs");
-        println!("cargo:rerun-if-changed=src/device/ascend_batch.c");
         println!("cargo:rerun-if-env-changed=ASCEND_HOME_PATH");
         println!("cargo:rerun-if-env-changed=ASCEND_HOME");
     }

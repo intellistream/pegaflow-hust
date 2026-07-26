@@ -25,6 +25,12 @@ use super::{CopyDesc, TransferBackend};
 /// ``ascend::memcpy_h2d_batch_async`` / ``ascend::memcpy_d2h_batch_async``.
 pub struct AscendMemcpyBackend;
 
+impl AscendMemcpyBackend {
+    pub fn new(_device_id: i32) -> Self {
+        Self
+    }
+}
+
 impl TransferBackend for AscendMemcpyBackend {
     fn h2d(&self, copies: &[CopyDesc], stream: &Arc<DeviceStream>) -> Result<(), String> {
         let ascend_stream = match stream.as_ref() {
