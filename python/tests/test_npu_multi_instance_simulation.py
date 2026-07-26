@@ -38,17 +38,22 @@ pytestmark = [
 
 
 def _require_server():
-    from pegaflow.pegaflow import EngineRpcClient
-    c = EngineRpcClient()
-    ok, _ = c.health()
-    if not ok:
-        pytest.skip("pegaflow-server not healthy")
+    try:
+        from pegaflow.pegaflow import EngineRpcClient
+        c = EngineRpcClient()
+        result = c.health()
+        if not isinstance(result, (list, tuple)) or len(result) < 1:
+            pytest.skip("pegaflow-server health check returned unexpected result")
+        ok = result[0]
+        if not ok:
+            pytest.skip("pegaflow-server not healthy")
+    except Exception:
+        pytest.skip("pegaflow-server not reachable")
 
 
 def _require_camem():
-    try:
-        from vllm_ascend.device_allocator.camem import CaMemAllocator
-    except ImportError:
+    from importlib.util import find_spec
+    if find_spec("vllm_ascend.device_allocator.camem") is None:
         pytest.skip("camem_allocator not available (vllm_ascend_C not built)")
 
 

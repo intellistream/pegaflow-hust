@@ -484,7 +484,7 @@ class TestRealConnectorFunctions:
 
     def test_real_resolve_device_id_callable(self):
         try:
-            from pegaflow.connector import _map_device, _resolve_device_id
+            from pegaflow.connector import _resolve_device_id
         except ImportError:
             pytest.skip("pegaflow.connector not importable (missing vllm/torch)")
 
