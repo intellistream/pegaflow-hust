@@ -74,7 +74,9 @@ impl TransferBackend for AscendMemcpyBackend {
         ascend::memcpy_d2h_batch_async(&batch, ascend_stream)
     }
 
-    fn name(&self) -> &'static str { "ascend_batch" }
+    fn name(&self) -> &'static str {
+        "ascend_batch"
+    }
 }
 
 #[cfg(test)]

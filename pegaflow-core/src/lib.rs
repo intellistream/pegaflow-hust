@@ -61,7 +61,9 @@ use std::{
 use log::{debug, info};
 
 use crate::backing::SSD_ALIGNMENT;
-use crate::gpu_worker::{GpuWorkerPool, HostBlock, LayerTransferData, LoadCompletion, LoadTask, TransferBlock};
+use crate::gpu_worker::{
+    GpuWorkerPool, HostBlock, LayerTransferData, LoadCompletion, LoadTask, TransferBlock,
+};
 use crate::lease::QueryLeaseManager;
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
@@ -432,11 +434,7 @@ impl PegaEngine {
 
         // Get or create the global GPU worker pool for this device.
         // The pool survives instance unregistration so pending saves drain.
-        let worker_pool = self.get_or_create_gpu_pool(
-            device_id,
-            numa_node,
-            transfer_mode,
-        )?;
+        let worker_pool = self.get_or_create_gpu_pool(device_id, numa_node, transfer_mode)?;
 
         // Register GPU with all layers.
         instance.register_new_gpu(

@@ -539,7 +539,9 @@ impl InstanceContext {
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
     /// or `EngineError::DeviceInit` if device context creation fails.
-    pub(crate) fn build_device_context_static(device_id: i32) -> Result<DeviceContext, EngineError> {
+    pub(crate) fn build_device_context_static(
+        device_id: i32,
+    ) -> Result<DeviceContext, EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
                 "device_id {device_id} must be >= 0"

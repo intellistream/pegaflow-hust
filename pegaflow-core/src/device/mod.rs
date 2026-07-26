@@ -107,7 +107,8 @@ impl DeviceStream {
                 use crate::device::ascend;
                 use std::alloc::{Layout, alloc, dealloc};
 
-                let size = len.checked_mul(std::mem::size_of::<T>())
+                let size = len
+                    .checked_mul(std::mem::size_of::<T>())
                     .ok_or_else(|| "alloc_zeros: size overflow".to_string())?;
                 if size == 0 {
                     return Err("alloc_zeros: size must be > 0".into());

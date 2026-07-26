@@ -336,18 +336,18 @@ fn ascend_load_save_concurrent_streams() {
         host_device: host_ptr as u64,
         size: SIZE,
     };
-    let save_stream_arc: Arc<DeviceStream> =
-        Arc::new(DeviceStream::Ascend(save_stream));
+    let save_stream_arc: Arc<DeviceStream> = Arc::new(DeviceStream::Ascend(save_stream));
 
-    backend.d2h(&[save_desc], &save_stream_arc).expect("save D2H");
+    backend
+        .d2h(&[save_desc], &save_stream_arc)
+        .expect("save D2H");
 
     // Record event on save stream to wait for save completion
     let save_done = save_stream_arc.record_event().expect("record save event");
 
     // While save is in-flight, prepare load (H2D) on load_stream
     // but wait for save to complete first via the event
-    let load_stream_arc: Arc<DeviceStream> =
-        Arc::new(DeviceStream::Ascend(load_stream));
+    let load_stream_arc: Arc<DeviceStream> = Arc::new(DeviceStream::Ascend(load_stream));
 
     // Wait for save to complete before loading
     DeviceStream::wait_event(&save_done).expect("wait save event");
@@ -356,7 +356,9 @@ fn ascend_load_save_concurrent_streams() {
     let zeros = vec![0u8; SIZE];
     ascend::memcpy_h2d_sync(dev_ptr, zeros.as_ptr(), SIZE).expect("corrupt");
 
-    backend.h2d(&[save_desc], &load_stream_arc).expect("load H2D");
+    backend
+        .h2d(&[save_desc], &load_stream_arc)
+        .expect("load H2D");
 
     // Wait for load to complete
     #[allow(irrefutable_let_patterns)]
@@ -398,11 +400,7 @@ fn ascend_multi_instance_pinned_memory() {
     const SIZE: usize = 65536; // 64 KiB
 
     // Test on device 0 (and device 1 if available)
-    let devices_to_test: Vec<i32> = if count >= 2 {
-        vec![0, 1]
-    } else {
-        vec![0]
-    };
+    let devices_to_test: Vec<i32> = if count >= 2 { vec![0, 1] } else { vec![0] };
 
     let mut allocations: Vec<(*mut u8, i32)> = Vec::new();
 

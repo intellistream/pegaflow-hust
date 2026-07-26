@@ -570,9 +570,9 @@ fn process_save_task(
                         )));
                     }
                 }
-                stream.synchronize().map_err(|e| {
-                    EngineError::Storage(format!("Failed to synchronize: {e}"))
-                })?;
+                stream
+                    .synchronize()
+                    .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e}")))?;
                 Ok(())
             } else {
                 Err(format!(
