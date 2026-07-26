@@ -1,0 +1,16 @@
+# Ruff configuration for pegaflow-hust repo root.
+# The CI action runs `ruff check` from the repo root.
+
+extend-exclude = [
+    "target/",
+    ".github/",
+    "pegaflow-core/",
+    # Benchmark/diagnostic scripts — not production code
+    "diag_block_hash.py",
+    "run_npu_benchmark.py",
+    # Upstream scripts with pre-existing issues
+    "scripts/",
+]
+
+[lint]
+ignore = []

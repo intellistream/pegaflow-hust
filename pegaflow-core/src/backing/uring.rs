@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 
 use super::SSD_ALIGNMENT;
 
-const DEFAULT_URING_THREADS: usize = 1;  // memlock hard limit 64KB requires single thread
+const DEFAULT_URING_THREADS: usize = 16;
 
 /// Configuration for io_uring engine.
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ impl Default for UringConfig {
     fn default() -> Self {
         Self {
             threads: DEFAULT_URING_THREADS,
-            io_depth: 8,
+            io_depth: 128,
             sqpoll: false,
             sqpoll_idle: 10,
         }

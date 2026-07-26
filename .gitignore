@@ -31,3 +31,7 @@ CLAUDE.local.md
 # Local technical reports
 技术报告*.md
 e2e_*.py
+
+# Environment-specific docs (not for upstream)
+docs/hardware-environment.md
+docs/p2-3-benchmarks.md

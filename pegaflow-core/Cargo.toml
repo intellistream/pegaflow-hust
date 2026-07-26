@@ -3,6 +3,13 @@ name = "pegaflow-core"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "dma_stress"
+path = "src/bin/dma_stress.rs"
+required-features = ["ascend"]
+
+[build-dependencies]
+
 [lints]
 workspace = true
 
@@ -61,6 +68,10 @@ harness = false
 
 [[bench]]
 name = "transfer_h2d"
+harness = false
+
+[[bench]]
+name = "ascend_transfer"
 harness = false
 
 [[example]]

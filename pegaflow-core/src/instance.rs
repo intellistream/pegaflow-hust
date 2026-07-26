@@ -241,32 +241,20 @@ pub struct GpuContext {
     /// Device context handle (kept alive for the lifetime of this context).
     _device_ctx: DeviceContext,
 
-    /// Worker thread pool for asynchronous GPU operations.
-    worker_pool: GpuWorkerPool,
+    /// Worker thread pool for asynchronous GPU operations (shared across instances).
+    worker_pool: Arc<GpuWorkerPool>,
 }
 
 impl GpuContext {
-    /// Create a new GPU context for the specified device.
-    ///
-    /// The `numa_node` should be obtained from `NumaTopology::numa_for_gpu()`.
-    /// Worker threads will be pinned to the specified NUMA node for optimal
-    /// memory locality during transfers.
-    ///
-    /// # Errors
-    /// Returns `EngineError::DeviceInit` if device context creation or worker
-    /// pool initialization fails.
     fn new(
         device_ctx: DeviceContext,
         device_id: i32,
         tp_rank: usize,
         pp_rank: usize,
         numa_node: NumaNode,
-        transfer_mode: TransferMode,
         kv_caches: HashMap<String, KVCacheLayout>,
+        worker_pool: Arc<GpuWorkerPool>,
     ) -> Result<Self, EngineError> {
-        let worker_pool =
-            GpuWorkerPool::spawn(device_id, device_ctx.clone(), numa_node, transfer_mode)?;
-
         Ok(Self {
             device_id,
             tp_rank,
@@ -551,8 +539,7 @@ impl InstanceContext {
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
     /// or `EngineError::DeviceInit` if device context creation fails.
-    fn build_device_context(
-        &self,
+    pub(crate) fn build_device_context_static(
         device_id: i32,
     ) -> Result<DeviceContext, EngineError> {
         if device_id < 0 {
@@ -560,26 +547,20 @@ impl InstanceContext {
                 "device_id {device_id} must be >= 0"
             )));
         }
-
         #[cfg(feature = "cuda")]
         {
             use crate::device::cuda::CudaDevice;
-            let cuda = CudaDevice::new(device_id).map_err(|e| {
-                EngineError::DeviceInit(format!("CUDA device {device_id}: {e}"))
-            })?;
+            let cuda = CudaDevice::new(device_id)
+                .map_err(|e| EngineError::DeviceInit(format!("CUDA device {device_id}: {e}")))?;
             return Ok(DeviceContext::Cuda(Box::new(cuda)));
         }
-
         #[cfg(all(feature = "ascend", not(feature = "cuda")))]
         {
             use crate::device::ascend::AscendDevice;
-            let ascend = AscendDevice::new(device_id).map_err(|e| {
-                EngineError::DeviceInit(format!("Ascend device {device_id}: {e}"))
-            })?;
+            let ascend = AscendDevice::new(device_id)
+                .map_err(|e| EngineError::DeviceInit(format!("Ascend device {device_id}: {e}")))?;
             return Ok(DeviceContext::Ascend(ascend));
         }
-
-        // No device feature enabled
         #[cfg(not(any(feature = "cuda", feature = "ascend")))]
         {
             Err(EngineError::DeviceInit(
@@ -587,6 +568,10 @@ impl InstanceContext {
                     .into(),
             ))
         }
+    }
+
+    fn build_device_context(&self, device_id: i32) -> Result<DeviceContext, EngineError> {
+        Self::build_device_context_static(device_id)
     }
 
     /// Build a GPU context for the specified device.
@@ -605,8 +590,8 @@ impl InstanceContext {
         tp_rank: usize,
         pp_rank: usize,
         numa_node: NumaNode,
-        transfer_mode: TransferMode,
         kv_caches: HashMap<String, KVCacheLayout>,
+        worker_pool: Arc<GpuWorkerPool>,
     ) -> Result<Arc<GpuContext>, EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
@@ -622,8 +607,8 @@ impl InstanceContext {
             tp_rank,
             pp_rank,
             numa_node,
-            transfer_mode,
             kv_caches,
+            worker_pool,
         )?))
     }
 
@@ -669,14 +654,15 @@ impl InstanceContext {
     pub(crate) fn register_new_gpu(
         &self,
         registration: GpuRegistration,
+        worker_pool: Arc<GpuWorkerPool>,
     ) -> Result<(), EngineError> {
         let GpuRegistration {
             device_id,
             tp_rank,
             pp_rank,
             numa_node,
-            transfer_mode,
             kv_caches,
+            ..
         } = registration;
 
         if tp_rank >= self.tp_size {
@@ -701,8 +687,8 @@ impl InstanceContext {
             tp_rank,
             pp_rank,
             numa_node,
-            transfer_mode,
             kv_caches,
+            worker_pool,
         )?;
 
         {

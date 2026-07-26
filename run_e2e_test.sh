@@ -23,14 +23,26 @@ TAG="e2e-$(date +%H%M%S)"
 SERVER_LOG="/tmp/pegaflow-server-${TAG}.log"
 
 # ---- 环境变量 ----
+# Resolve Ascend paths from environment, with sensible fallbacks.
+ASCEND_HOME="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-8.5.1}"
+ASCEND_DRIVER="${ASCEND_HOME_PATH:+$(dirname "$ASCEND_HOME_PATH")/driver}/lib64/driver"
+ASCEND_DRIVER="${ASCEND_DRIVER:-/usr/local/Ascend/driver/lib64/driver}"
+# ATB lib: find any installed version under nnal/atb
+ATB_LIB=$(ls -d /usr/local/Ascend/nnal/atb/*/atb/cxx_abi_1/lib 2>/dev/null | head -1)
+ATB_LIB="${ATB_LIB:-/usr/local/Ascend/nnal/atb/8.5.1/atb/cxx_abi_1/lib}"
+# Use PEGAFLOW_VENV if set, otherwise try the vllm-hust-dev conda env.
+# (CONDA_PREFIX is NOT used because it points to the base conda, not the env.)
+VENV_DIR="${PEGAFLOW_VENV:-/root/miniconda3/envs/vllm-hust-dev}"
+PYTHON="${VENV_DIR}/bin/python"
+
 export LD_LIBRARY_PATH="\
-/root/miniconda3/envs/vllm-hust-dev/lib:\
-/usr/local/Ascend/cann-8.5.1/aarch64-linux/lib64:\
-/usr/local/Ascend/driver/lib64/driver:\
-/usr/local/Ascend/nnal/atb/8.5.1/atb/cxx_abi_1/lib"
+${VENV_DIR}/lib:\
+${ASCEND_HOME}/lib64:\
+${ASCEND_HOME}/aarch64-linux/lib64:\
+${ASCEND_DRIVER}:\
+${ATB_LIB}"
 export ASCEND_VISIBLE_DEVICES="${NPU_DEVICE}"
-export PYTHONPATH="/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages"
-PYTHON="/root/miniconda3/envs/vllm-hust-dev/bin/python"
+export PYTHONPATH="${VENV_DIR}/lib/python3.11/site-packages"
 CARGO_TARGET="/workspace/pegaflow-hust/target/debug"
 PYO3_SRC="${CARGO_TARGET}/libpegaflow.so"
 PYO3_DST="/workspace/pegaflow-hust/python/pegaflow/pegaflow.cpython-311-aarch64-linux-gnu.so"
@@ -51,7 +63,7 @@ echo "[1/4] Building pegaflow..."
 cd /workspace/pegaflow-hust
 PYO3_PYTHON="${PYTHON}" cargo build --no-default-features --features ascend \
   -p pegaflow-py --bin pegaflow-server-py 2>&1 | tail -1
-cp -f "${PYO3_SRC}" "${PYO3_DST}"
+\cp -f "${PYO3_SRC}" "${PYO3_DST}"
 echo "  Build OK"
 
 # ---- Step 2: Start server ----

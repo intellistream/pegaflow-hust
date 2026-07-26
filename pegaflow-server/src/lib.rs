@@ -349,10 +349,7 @@ fn detect_devices() -> Result<Vec<i32>, std::io::Error> {
         Ok(dev)
     })
     .map_err(|err| {
-        std::io::Error::other(format!(
-            "failed to detect devices: {}",
-            format_py_err(err)
-        ))
+        std::io::Error::other(format!("failed to detect devices: {}", format_py_err(err)))
     })
 }
 
@@ -484,11 +481,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let devices = if cli.devices.is_empty() {
         // Auto-detect all available devices
         let detected = detect_devices()?;
-        info!(
-            "Auto-detected {} device(s): {:?}",
-            detected.len(),
-            detected
-        );
+        info!("Auto-detected {} device(s): {:?}", detected.len(), detected);
         detected
     } else {
         info!("Using specified device(s): {:?}", cli.devices);

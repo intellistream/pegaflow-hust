@@ -31,7 +31,7 @@ def _import_resolve_device_id():
     # Try to import from the actual module. If torch is not installed,
     # we'll test the logic in isolation.
     try:
-        from pegaflow.connector import _resolve_device_id, _map_device
+        from pegaflow.connector import _map_device, _resolve_device_id
 
         return _resolve_device_id, _map_device
     except ImportError:
@@ -368,8 +368,25 @@ class TestDeriveNamespace:
 
 class TestResolveTransferBackend:
     def test_mla_defaults_to_kernel(self):
+        """CUDA MLA defaults to 'kernel'. Pass is_npu=False explicitly to
+        prevent NPU auto-detection from overriding the default."""
         _, _, resolve_transfer_backend = _import_common()
-        assert resolve_transfer_backend(is_mla=True, override=None) == "kernel"
+        assert (
+            resolve_transfer_backend(is_mla=True, override=None, is_npu=False)
+            == "kernel"
+        )
+
+    def test_mla_defaults_to_direct_on_npu(self):
+        """On NPU systems, MLA must default to 'direct' — kernel is CUDA-only."""
+        _, _, resolve_transfer_backend = _import_common()
+        # Auto-detect NPU (this machine has torch.npu available)
+        backend = resolve_transfer_backend(is_mla=True, override=None)
+        assert backend in ("direct", "kernel"), f"unexpected backend: {backend}"
+        # When explicitly on NPU, must be 'direct'
+        assert (
+            resolve_transfer_backend(is_mla=True, override=None, is_npu=True)
+            == "direct"
+        )
 
     def test_non_mla_defaults_to_direct(self):
         _, _, resolve_transfer_backend = _import_common()

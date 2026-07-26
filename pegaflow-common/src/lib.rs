@@ -8,6 +8,6 @@ pub use block::BlockKey;
 #[cfg(target_os = "linux")]
 pub use numa::{
     NumaNode, NumaTopology, format_cpu_list, get_npu_device_count, get_npu_numa_affinity,
-    get_npu_numa_node, pin_thread_to_numa_node, query_pages_numa,
-    read_cpu_topology_from_sysfs, run_on_numa,
+    get_npu_numa_node, pin_thread_to_numa_node, query_pages_numa, read_cpu_topology_from_sysfs,
+    run_on_numa,
 };

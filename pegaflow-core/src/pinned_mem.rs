@@ -221,15 +221,20 @@ impl PinnedMemory {
 
     /// Allocate pinned memory via `aclrtMallocHost` for Ascend NPU devices.
     ///
+    /// `device_id` selects which NPU device context to activate, enabling
+    /// NUMA-aware placement when the NPU sits on a specific NUMA node.
     /// Allocation is 64-byte aligned per CANN requirements. Returns host and
     /// device pointers as a single allocation.
     #[cfg(feature = "ascend")]
-    pub(crate) fn allocate_ascend_host(size: usize) -> Result<Self, PinnedMemError> {
+    pub(crate) fn allocate_ascend_host(
+        device_id: i32,
+        size: usize,
+    ) -> Result<Self, PinnedMemError> {
         if size == 0 {
             return Err(PinnedMemError::ZeroSize);
         }
-        let (host, device) =
-            crate::device::ascend::malloc_host(size).map_err(PinnedMemError::AscendAllocFailed)?;
+        let (host, device) = crate::device::ascend::malloc_host(device_id, size)
+            .map_err(PinnedMemError::AscendAllocFailed)?;
         let ptr = NonNull::new(host).expect("aclrtMallocHost returned null");
         let device_ptr = NonNull::new(device).expect("aclrtMallocHost returned null device ptr");
         Ok(Self {
@@ -546,7 +551,7 @@ mod tests {
         // across multiple size classes.
         let sizes: &[usize] = &[1, 63, 64, 65, 127, 128, 1024, 4096, 65536];
         for &size in sizes {
-            let mem = PinnedMemory::allocate_ascend_host(size)
+            let mem = PinnedMemory::allocate_ascend_host(0 /* device_id */, size)
                 .unwrap_or_else(|e| panic!("allocate_ascend_host({size}) failed: {e}"));
             let addr = mem.as_ptr() as usize;
             assert!(
@@ -560,7 +565,7 @@ mod tests {
     #[cfg(feature = "ascend")]
     #[test]
     fn test_allocate_ascend_host_zero_fails() {
-        let result = PinnedMemory::allocate_ascend_host(0);
+        let result = PinnedMemory::allocate_ascend_host(0 /* device_id */, 0);
         assert!(matches!(result, Err(PinnedMemError::ZeroSize)));
     }
 }

@@ -33,9 +33,9 @@ mod transfer_engine_builder;
 mod utils;
 mod verbs;
 mod worker;
-pub use crate::device::{CudaDeviceId, Device};
 #[cfg(feature = "ascend")]
 pub use crate::device::AscendDeviceId;
+pub use crate::device::{CudaDeviceId, Device};
 pub use api::{
     BarrierTransferRequest, DomainAddress, DomainGroupRouting, GroupTransferRouting, ImmCounter,
     ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle, MemoryRegionRemoteKey,

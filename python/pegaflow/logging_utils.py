@@ -13,7 +13,12 @@ def get_connector_logger() -> logging.Logger:
     if not connector_logger.hasHandlers():
         handler = logging.StreamHandler()
         handler.setLevel(logging.NOTSET)
-        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
+                datefmt="%m-%d %H:%M:%S",
+            )
+        )
         connector_logger.addHandler(handler)
         connector_logger.propagate = False
     return connector_logger

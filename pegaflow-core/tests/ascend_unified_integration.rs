@@ -88,15 +88,16 @@ fn ascend_unified_save_load_chain() {
 
     // Write test KV cache data to device (simulating what vLLM puts there)
     let src_data: Vec<u8> = vec![1u8; SIZE]; // Using 1s as per task spec
-    ascend::memcpy_h2d_sync(dev_ptr, src_data.as_ptr(), SIZE)
-        .expect("sync H2D of test data");
+    ascend::memcpy_h2d_sync(dev_ptr, src_data.as_ptr(), SIZE).expect("sync H2D of test data");
 
     // ─ Layer 4: Allocate pinned host memory (simulating engine mem pool) ─
 
-    let (host_ptr, _device_ptr) =
-        ascend::malloc_host(SIZE).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(SIZE).expect("aclrtMallocHost");
 
-    eprintln!("INFO: Pinned host memory allocated: host=0x{:x}", host_ptr as usize);
+    eprintln!(
+        "INFO: Pinned host memory allocated: host=0x{:x}",
+        host_ptr as usize
+    );
 
     // Verify alignment
     assert!(
@@ -116,7 +117,7 @@ fn ascend_unified_save_load_chain() {
         size: SIZE,
     };
 
-    let backend = AscendMemcpyBackend;
+    let backend = AscendMemcpyBackend::new(0);
 
     // Execute D2H (simulating save path)
     backend.d2h(&[desc], &stream).expect("backend d2h = save");
@@ -132,7 +133,8 @@ fn ascend_unified_save_load_chain() {
     // SAFETY: host_ptr points to allocated memory of SIZE bytes.
     let host_slice = unsafe { std::slice::from_raw_parts(host_ptr, SIZE) };
     assert_eq!(
-        host_slice, &src_data[..],
+        host_slice,
+        &src_data[..],
         "saved data does not match source"
     );
 
@@ -195,8 +197,7 @@ fn ascend_unified_multi_layer() {
     let policy: i32 = 0;
 
     let dev_ptr = ascend::malloc_device(TOTAL, policy).expect("aclrtMalloc");
-    let (host_ptr, _device_ptr) =
-        ascend::malloc_host(TOTAL).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(TOTAL).expect("aclrtMallocHost");
 
     // Fill each layer with distinct patterns
     let mut src_data = vec![0u8; TOTAL];
@@ -205,8 +206,7 @@ fn ascend_unified_multi_layer() {
         let val = if layer == 0 { 0xAAu8 } else { 0xBBu8 };
         src_data[start..start + LAYER_SIZE].fill(val);
     }
-    ascend::memcpy_h2d_sync(dev_ptr, src_data.as_ptr(), TOTAL)
-        .expect("initial H2D");
+    ascend::memcpy_h2d_sync(dev_ptr, src_data.as_ptr(), TOTAL).expect("initial H2D");
 
     let stream = device.create_stream().expect("create stream");
     let stream: Arc<DeviceStream> = Arc::new(DeviceStream::Ascend(stream));
@@ -225,7 +225,7 @@ fn ascend_unified_multi_layer() {
         })
         .collect();
 
-    let backend = AscendMemcpyBackend;
+    let backend = AscendMemcpyBackend::new(0);
 
     // Save (D2H) both layers
     backend.d2h(&descs, &stream).expect("multi-layer d2h");
@@ -237,10 +237,7 @@ fn ascend_unified_multi_layer() {
 
     // Verify host data
     let host_slice = unsafe { std::slice::from_raw_parts(host_ptr, TOTAL) };
-    assert_eq!(
-        host_slice, &src_data[..],
-        "multi-layer saved data mismatch"
-    );
+    assert_eq!(host_slice, &src_data[..], "multi-layer saved data mismatch");
 
     // Corrupt device data
     let zeros = vec![0u8; TOTAL];
@@ -257,10 +254,7 @@ fn ascend_unified_multi_layer() {
     // Verify
     let mut verify = vec![0u8; TOTAL];
     ascend::memcpy_d2h_sync(verify.as_mut_ptr(), dev_ptr, TOTAL).expect("verify");
-    assert_eq!(
-        verify, src_data,
-        "multi-layer load mismatch"
-    );
+    assert_eq!(verify, src_data, "multi-layer load mismatch");
 
     ascend::free_host(host_ptr).ok();
     ascend::free_device(dev_ptr).ok();

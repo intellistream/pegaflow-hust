@@ -260,41 +260,66 @@ where
 // Device NUMA affinity — npu-smi (Ascend NPU)
 // ============================================================================
 
-/// Discover NPU device count via `npu-smi info -t board`.
+/// Discover NPU device count via `npu-smi info -m`.
 ///
-/// Parses the output to count how many NPU chips are present.
-/// Falls back to counting `/sys/class/davinci/davinci*` entries
-/// if `npu-smi` is not available.
+/// Parses the device listing to count unique Ascend NPU chips (skipping MCU
+/// companion chips). Falls back to counting `/dev/davinci*` entries (or the
+/// container-equivalent `/sys/devices/virtual/devdrv-class/davinci*`) if
+/// `npu-smi` is not available.
 ///
 /// This function is public so that integration tests can verify
 /// NPU detection and NUMA affinity parsing without linking against
 /// the CANN runtime.
 pub fn get_npu_device_count() -> Option<u32> {
-    // Primary: use npu-smi
-    if let Ok(output) = Command::new("npu-smi")
-        .args(["info", "-t", "board", "-c", "0"])
-        .output()
+    // Primary: use npu-smi -m to list all devices
+    if let Ok(output) = Command::new("npu-smi").args(["info", "-m"]).output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // npu-smi info -t board outputs lines with chip/device info.
-            // Count lines that look like "NPU ID" / "Chip ID" entries.
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("Count") || trimmed.starts_with("Chip Count") {
-                    if let Some(val) = trimmed.split(':').nth(1) {
-                        if let Ok(count) = val.trim().parse::<u32>() {
-                            return Some(count);
-                        }
-                    }
-                }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Count unique NPU IDs (skip MCU chips with Chip Logic ID = "-").
+        let mut count = 0u32;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            // Only count lines that have a numeric Chip Logic ID (not "-" for MCU).
+            if trimmed.starts_with(|c: char| c.is_ascii_digit()) && trimmed.contains("Ascend") {
+                count += 1;
             }
+        }
+        if count > 0 {
+            return Some(count);
         }
     }
 
-    // Fallback: count /sys/class/davinci devices
-    if let Ok(entries) = fs::read_dir("/sys/class/davinci") {
-        let count = entries.filter_map(|e| e.ok()).count();
+    // Fallback 1: count /dev/davinci devices (container with device nodes)
+    match fs::read_dir("/dev") {
+        Ok(entries) => {
+            let count = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with("davinci") && n != "davinci_manager")
+                        .unwrap_or(false)
+                })
+                .count();
+            if count > 0 {
+                return Some(count as u32);
+            }
+        }
+        Err(_) => {}
+    }
+
+    // Fallback 2: count virtual devdrv-class entries (container without /dev access)
+    if let Ok(entries) = fs::read_dir("/sys/devices/virtual/devdrv-class") {
+        let count = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("davinci") && n != "davinci_manager")
+                    .unwrap_or(false)
+            })
+            .count();
         if count > 0 {
             return Some(count as u32);
         }
@@ -307,46 +332,65 @@ pub fn get_npu_device_count() -> Option<u32> {
 ///
 /// Strategy (ordered by preference):
 /// 1. Read `/sys/class/davinci/davinci{device_id}/device/numa_node`
+///    or `/sys/devices/virtual/devdrv-class/davinci{device_id}/device/numa_node`
 ///    (most reliable, direct kernel interface).
-/// 2. Parse `npu-smi info -t topo -i {device_id}` output.
+/// 2. Parse `npu-smi info -t topo -i {device_id}` output:
+///    - "CPU Affinity" column → map first CPU to NUMA node via
+///      `/sys/devices/system/cpu/cpu{id}/node` symlink.
+///    - Legacy "NUMA Node: N" or "numa_node: N" lines.
 ///
 /// Returns `NumaNode::UNKNOWN` if all methods fail.
 ///
 /// This function is public so that integration tests can verify
 /// NUMA node assignment for Ascend NPUs.
 pub fn get_npu_numa_node(device_id: u32) -> NumaNode {
-    // Method 1: sysfs (fastest, most reliable, no external binary needed)
-    let numa_node_path = format!("/sys/class/davinci/davinci{device_id}/device/numa_node");
-    if let Ok(content) = fs::read_to_string(&numa_node_path) {
-        if let Ok(node) = content.trim().parse::<i32>() {
-            if node >= 0 {
-                return NumaNode(node as u32);
-            }
+    // Method 1: sysfs numa_node files.
+    // Container environments may use a virtual devdrv-class path instead of
+    // the standard /sys/class/davinci layout.
+    for candidate in [
+        format!("/sys/class/davinci/davinci{device_id}/device/numa_node"),
+        format!("/sys/devices/virtual/devdrv-class/davinci{device_id}/device/numa_node"),
+    ] {
+        if let Ok(content) = fs::read_to_string(&candidate)
+            && let Ok(node) = content.trim().parse::<i32>()
+            && node >= 0
+        {
+            return NumaNode(node as u32);
         }
     }
 
-    // Method 2: npu-smi topology query
+    // Method 2: npu-smi topology query.
+    // The output is a table with "NPU{n}" rows and a "CPU Affinity" column
+    // on the far right. Find the row that starts with "NPU{device_id}" and
+    // extract the last whitespace-separated field (the CPU range).
     if let Ok(output) = Command::new("npu-smi")
-        .args([
-            "info",
-            "-t",
-            "topo",
-            "-i",
-            &device_id.to_string(),
-        ])
+        .args(["info", "-t", "topo", "-i", &device_id.to_string()])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // npu-smi topo output may contain NUMA affinity info.
-            // Look for lines like "NUMA Node: 1" or "numa_node: 1".
-            for line in stdout.lines() {
-                let lower = line.to_lowercase();
-                if lower.contains("numa") && lower.contains("node") {
-                    // Try to extract the first number from this line.
-                    if let Some(node) = parse_first_int(line) {
-                        return NumaNode(node);
-                    }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Look for the row matching "NPU{device_id}" (e.g. "NPU0").
+        let marker = format!("NPU{device_id}");
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with(&marker) {
+                // The last whitespace-separated field is the CPU Affinity
+                // value, e.g. "144-167". Extract the first CPU and map to
+                // NUMA node.
+                if let Some(last_field) = trimmed.split_whitespace().last()
+                    && let Some(first_cpu) = parse_first_int(last_field)
+                    && let Some(node) = cpu_to_numa_node(first_cpu)
+                {
+                    return node;
+                }
+            }
+
+            // Legacy fallback: "NUMA Node: N" or "numa_node: N" lines.
+            let lower = line.to_lowercase();
+            if lower.contains("numa") && lower.contains("node") {
+                if let Some(node) = parse_first_int(line) {
+                    return NumaNode(node);
                 }
             }
         }
@@ -355,13 +399,34 @@ pub fn get_npu_numa_node(device_id: u32) -> NumaNode {
     NumaNode::UNKNOWN
 }
 
+/// Map a logical CPU number to its NUMA node via sysfs.
+///
+/// Reads `/sys/devices/system/cpu/cpu{id}/` and looks for a symlink
+/// named `node{N}` (e.g. `node6`). Returns the `N` as a `NumaNode`.
+///
+/// Returns `None` if the directory is missing or no `node*` entry exists.
+fn cpu_to_numa_node(cpu: u32) -> Option<NumaNode> {
+    let cpu_dir = format!("/sys/devices/system/cpu/cpu{cpu}");
+    let entries = fs::read_dir(&cpu_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or("");
+        if let Some(suffix) = name.strip_prefix("node")
+            && let Ok(node_id) = suffix.parse::<u32>()
+        {
+            return Some(NumaNode(node_id));
+        }
+    }
+    None
+}
+
 /// Extract the first unsigned integer from a string.
 fn parse_first_int(s: &str) -> Option<u32> {
     for token in s.split(|c: char| !c.is_ascii_digit()) {
-        if !token.is_empty() {
-            if let Ok(n) = token.parse::<u32>() {
-                return Some(n);
-            }
+        if !token.is_empty()
+            && let Ok(n) = token.parse::<u32>()
+        {
+            return Some(n);
         }
     }
     None
@@ -465,13 +530,19 @@ fn get_gpu_numa_affinity() -> Vec<(u32, NumaNode)> {
 fn get_device_numa_affinity() -> Vec<(u32, NumaNode)> {
     let npu_affinity = get_npu_numa_affinity();
     if !npu_affinity.is_empty() {
-        log::debug!("Detected {} NPU device(s) via npu-smi/sysfs", npu_affinity.len());
+        log::debug!(
+            "Detected {} NPU device(s) via npu-smi/sysfs",
+            npu_affinity.len()
+        );
         return npu_affinity;
     }
 
     let gpu_affinity = get_gpu_numa_affinity();
     if !gpu_affinity.is_empty() {
-        log::debug!("Detected {} GPU device(s) via nvidia-smi", gpu_affinity.len());
+        log::debug!(
+            "Detected {} GPU device(s) via nvidia-smi",
+            gpu_affinity.len()
+        );
         return gpu_affinity;
     }
 
@@ -529,6 +600,21 @@ impl NumaTopology {
             .get(&device_id)
             .copied()
             .unwrap_or(NumaNode::UNKNOWN)
+    }
+
+    /// Reverse lookup: find any device attached to a given NUMA node.
+    ///
+    /// Returns `None` if no device is known to be on this NUMA node.
+    pub fn device_for_numa(&self, node: NumaNode) -> Option<i32> {
+        self.device_numa_map
+            .iter()
+            .find(|&(_, n)| *n == node)
+            .map(|(&dev, _)| dev)
+    }
+
+    /// Returns a clone of the device→NUMA node mapping for downstream caching.
+    pub fn device_numa_map(&self) -> HashMap<i32, NumaNode> {
+        self.device_numa_map.clone()
     }
 
     /// Get all NUMA nodes in the system.
@@ -796,11 +882,7 @@ mod tests {
         match get_npu_device_count() {
             Some(count) if count >= 1 => {
                 // We expect a valid NUMA node if davinci0/device/numa_node exists.
-                if std::path::Path::new(
-                    "/sys/class/davinci/davinci0/device/numa_node",
-                )
-                .exists()
-                {
+                if std::path::Path::new("/sys/class/davinci/davinci0/device/numa_node").exists() {
                     assert!(
                         node.is_valid(),
                         "NPU device 0 exists but NUMA node is UNKNOWN"
@@ -828,10 +910,7 @@ mod tests {
         eprintln!("INFO: NPU NUMA affinity: {affinity:?}");
         // Verify each device has a valid NUMA node.
         for (device_id, node) in &affinity {
-            assert!(
-                node.is_valid(),
-                "device {device_id} has UNKNOWN NUMA node"
-            );
+            assert!(node.is_valid(), "device {device_id} has UNKNOWN NUMA node");
         }
         // Device IDs should be consecutive from 0.
         for (i, (device_id, _)) in affinity.iter().enumerate() {
@@ -847,7 +926,10 @@ mod tests {
     #[test]
     fn test_numa_topology_detect_with_npu() {
         let topology = NumaTopology::detect();
-        assert!(topology.num_nodes() >= 1, "should have at least 1 NUMA node");
+        assert!(
+            topology.num_nodes() >= 1,
+            "should have at least 1 NUMA node"
+        );
 
         let npu_count = get_npu_device_count();
         if let Some(expected) = npu_count

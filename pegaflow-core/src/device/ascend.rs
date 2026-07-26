@@ -2,6 +2,7 @@
 //!
 //! Uses `extern "C"` FFI to call CANN `libascendcl.so` APIs:
 //! `aclrtSetDevice`, `aclrtCreateStream`, `aclrtSynchronizeStream`,
+//! `aclrtCreateEvent`, `aclrtRecordEvent`, `aclrtSynchronizeEvent`,
 //! `aclrtMemcpyAsync` (HOST_TO_DEVICE / DEVICE_TO_HOST).
 //!
 //! # Safety
@@ -22,8 +23,19 @@ type aclError = i32;
 #[allow(non_camel_case_types)]
 type aclrtStream = *mut c_void;
 
+#[allow(non_camel_case_types)]
+type aclrtEvent = *mut c_void;
+
 #[allow(non_camel_case_types, dead_code)]
 type aclrtContext = *mut c_void;
+
+/// Opaque handle for aclrtMemcpyAttr (used by aclrtMemcpyBatchAsync).
+/// Always passed as NULL for pegaflow's usage — we never use attributes.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct AclrtMemcpyAttr {
+    _private: u8,
+}
 
 /// Success return code for all CANN ACL APIs.
 pub(crate) const ACL_ERROR_NONE: i32 = 0;
@@ -86,8 +98,42 @@ unsafe extern "C" {
     /// Free pinned host memory.
     fn aclrtFreeHost(ptr: *mut c_void) -> aclError;
 
+    /// Batched asynchronous memory copy (CANN 8.5+).
+    /// Transfers multiple discontiguous regions in a single call,
+    /// matching the vllm-ascend ``swap_blocks_batch`` pattern.
+    /// `kind`: 1 = HOST_TO_DEVICE, 2 = DEVICE_TO_HOST.
+    fn aclrtMemcpyBatchAsync(
+        dst: *const *mut c_void,
+        dst_max: *const usize,
+        src: *const *const c_void,
+        count: *const usize,
+        n: u32,
+        attr: *const AclrtMemcpyAttr,
+        attrs_index: *const i32,
+        num_attrs: u32,
+        fail_index: *mut u32,
+        stream: aclrtStream,
+    ) -> aclError;
+
     /// Get C_ANN runtime version.
     fn aclrtGetVersion(major: *mut i32, minor: *mut i32, patch: *mut i32) -> aclError;
+
+    // -- Event APIs -----------------------------------------------------
+
+    /// Create an event. `flag` is reserved (pass 0).
+    fn aclrtCreateEvent(event: *mut aclrtEvent) -> aclError;
+
+    /// Destroy an event.
+    fn aclrtDestroyEvent(event: aclrtEvent) -> aclError;
+
+    /// Record an event into a stream, capturing the stream's progress at
+    /// this point so the CPU (or another stream) can later wait on it.
+    fn aclrtRecordEvent(event: aclrtEvent, stream: aclrtStream) -> aclError;
+
+    /// Block the calling thread until the event is recorded (i.e. until
+    /// all preceding work in the event's stream has completed).
+    fn aclrtSynchronizeEvent(event: aclrtEvent) -> aclError;
+
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +252,17 @@ impl AscendDeviceStream {
     pub fn synchronize(&self) -> Result<(), String> {
         let ret = unsafe { aclrtSynchronizeStream(self.stream) };
         if ret != ACL_ERROR_NONE {
-            return Err(format!(
-                "aclrtSynchronizeStream failed: error code {ret}"
-            ));
+            return Err(format!("aclrtSynchronizeStream failed: error code {ret}"));
         }
         Ok(())
+    }
+
+    /// Record an event on this stream, capturing the stream's progress so the
+    /// CPU (or another stream) can later wait on this specific point.
+    pub fn record_event(&self) -> Result<AscendEvent, String> {
+        let event = AscendEvent::new()?;
+        event.record(self.stream)?;
+        Ok(event)
     }
 
     /// Return the raw `aclrtStream` handle.
@@ -226,12 +278,103 @@ unsafe impl Sync for AscendDeviceStream {}
 
 impl Drop for AscendDeviceStream {
     fn drop(&mut self) {
-        if !self.stream.is_null() {
-            if ensure_acl_initialized().is_ok() {
-                let ret = unsafe { aclrtDestroyStream(self.stream) };
-                if ret != ACL_ERROR_NONE {
-                    log::warn!("aclrtDestroyStream failed: error code {ret}");
-                }
+        if !self.stream.is_null() && ensure_acl_initialized().is_ok() {
+            let ret = unsafe { aclrtDestroyStream(self.stream) };
+            if ret != ACL_ERROR_NONE {
+                log::warn!("aclrtDestroyStream failed: error code {ret}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AscendEvent
+// ---------------------------------------------------------------------------
+
+/// Ascend event handle wrapping an `aclrtEvent`.
+///
+/// Events allow fine-grained synchronization: record an event into a stream,
+/// then later wait on that specific event (rather than synchronizing the
+/// entire stream). This is useful when multiple operations are in-flight on
+/// the same stream and the caller only needs to wait for a subset.
+///
+/// # Example
+///
+/// ```ignore
+/// let event = stream.record_event()?;
+/// // ... submit more work to stream ...
+/// AscendEvent::wait(&event)?;  // blocks until the event point is reached
+/// ```
+#[derive(Debug)]
+pub struct AscendEvent {
+    event: aclrtEvent,
+}
+
+impl AscendEvent {
+    /// Create a new event.
+    ///
+    /// `flag` is reserved and always set to 0.
+    pub fn new() -> Result<Self, String> {
+        ensure_acl_initialized()?;
+        let mut event: aclrtEvent = std::ptr::null_mut();
+        let ret = unsafe { aclrtCreateEvent(&mut event) };
+        if ret != ACL_ERROR_NONE {
+            return Err(format!("aclrtCreateEvent failed: error code {ret}"));
+        }
+        if event.is_null() {
+            return Err("aclrtCreateEvent returned null event".into());
+        }
+        Ok(Self { event })
+    }
+
+    /// Record this event into the given stream.
+    ///
+    /// The event captures the stream's progress at the point of this call;
+    /// subsequent waits on this event will block until all preceding work
+    /// in `stream` has completed.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn record(&self, stream: aclrtStream) -> Result<(), String> {
+        let ret = unsafe { aclrtRecordEvent(self.event, stream) };
+        if ret != ACL_ERROR_NONE {
+            return Err(format!("aclrtRecordEvent failed: error code {ret}"));
+        }
+        Ok(())
+    }
+
+    /// Block the calling thread until this event is recorded.
+    ///
+    /// Equivalent to `cudaEventSynchronize` / `aclrtSynchronizeEvent`.
+    pub fn synchronize(&self) -> Result<(), String> {
+        let ret = unsafe { aclrtSynchronizeEvent(self.event) };
+        if ret != ACL_ERROR_NONE {
+            return Err(format!("aclrtSynchronizeEvent failed: error code {ret}"));
+        }
+        Ok(())
+    }
+
+    /// Convenience helper: block until a previously recorded event completes.
+    ///
+    /// The `event` is the value returned by
+    /// [`DeviceStream::record_event`](super::DeviceStream::record_event).
+    /// Downcasts to either `AscendEvent` or `CudaEvent` and synchronizes.
+    pub fn wait(event: &Box<dyn std::any::Any + Send>) -> Result<(), String> {
+        event
+            .downcast_ref::<Self>()
+            .ok_or_else(|| "wait_event: event is not an AscendEvent".to_string())?
+            .synchronize()
+    }
+}
+
+// SAFETY: `aclrtEvent` is a handle that can be sent across threads.
+unsafe impl Send for AscendEvent {}
+unsafe impl Sync for AscendEvent {}
+
+impl Drop for AscendEvent {
+    fn drop(&mut self) {
+        if !self.event.is_null() && ensure_acl_initialized().is_ok() {
+            let ret = unsafe { aclrtDestroyEvent(self.event) };
+            if ret != ACL_ERROR_NONE {
+                log::warn!("aclrtDestroyEvent failed: error code {ret}");
             }
         }
     }
@@ -243,15 +386,19 @@ impl Drop for AscendDeviceStream {
 
 /// Allocate pinned host memory via `aclrtMallocHost`.
 ///
+/// `device_id` selects which NPU device context to activate before allocation.
 /// On Ascend, `aclrtMallocHost` returns both a host pointer and an
 /// associated device pointer in the same allocation, so no separate
 /// "get device pointer" call is needed.
-pub fn malloc_host(size: usize) -> Result<(*mut u8, *mut u8), String> {
+pub fn malloc_host(device_id: i32, size: usize) -> Result<(*mut u8, *mut u8), String> {
     ensure_acl_initialized()?;
-    // aclrtMallocHost requires an active device context
-    let ret = unsafe { aclrtSetDevice(0) };
+    // aclrtMallocHost requires an active device context.
+    // Use the provided device_id for NUMA-aware placement.
+    let ret = unsafe { aclrtSetDevice(device_id) };
     if ret != ACL_ERROR_NONE {
-        return Err(format!("aclrtSetDevice(0) before malloc_host({size}) failed: error code {ret}"));
+        return Err(format!(
+            "aclrtSetDevice({device_id}) before malloc_host({size}) failed: error code {ret}"
+        ));
     }
     if size == 0 {
         return Err("aclrtMallocHost: size must be > 0".into());
@@ -285,7 +432,9 @@ pub fn free_host(ptr: *mut u8) -> Result<(), String> {
 /// Human-readable description for common CANN ACL error codes.
 fn acl_error_description(code: i32) -> &'static str {
     match code {
-        507899 => "memory not allocated via aclrtMallocPhysical (expandable_segments is not DMA-capable — use camem_allocator)",
+        507899 => {
+            "memory not allocated via aclrtMallocPhysical (expandable_segments is not DMA-capable — use camem_allocator)"
+        }
         207001 => "invalid parameter",
         207002 => "memory allocation failed",
         207003 => "device not available",
@@ -344,7 +493,11 @@ pub fn memcpy_h2d_async(
         ));
     }
 
-    // For other errors, try the synchronous fallback.
+    // For other errors (e.g. 507001 ACL_ERROR_RT_TS_ERROR), fall back to a
+    // synchronous aclrtMemcpy.  We intentionally do NOT call stream.synchronize()
+    // after the sync copy — the async call may have partially enqueued a task
+    // that leaves the stream in a bad state, and synchronize() would trigger the
+    // same TS error again.  The sync copy is already complete when it returns.
     log::warn!(
         "aclrtMemcpyAsync(H2D) failed: error {ret} ({desc}), size={size} — \
          falling back to synchronous aclrtMemcpy"
@@ -365,7 +518,6 @@ pub fn memcpy_h2d_async(
              error {ret} ({desc}), size={size}."
         ));
     }
-    stream.synchronize()?;
     log::debug!("aclrtMemcpy(H2D sync fallback) succeeded: size={size}");
     Ok(())
 }
@@ -414,7 +566,11 @@ pub fn memcpy_d2h_async(
         ));
     }
 
-    // For other errors, try the synchronous fallback.
+    // For other errors (e.g. 507001 ACL_ERROR_RT_TS_ERROR), fall back to a
+    // synchronous aclrtMemcpy.  We intentionally do NOT call stream.synchronize()
+    // after the sync copy — the async call may have partially enqueued a task
+    // that leaves the stream in a bad state, and synchronize() would trigger the
+    // same TS error again.  The sync copy is already complete when it returns.
     log::warn!(
         "aclrtMemcpyAsync(D2H) failed: error {ret} ({desc}), size={size} — \
          falling back to synchronous aclrtMemcpy"
@@ -435,14 +591,136 @@ pub fn memcpy_d2h_async(
              error {ret} ({desc}), size={size}."
         ));
     }
-    stream.synchronize()?;
     log::debug!("aclrtMemcpy(D2H sync fallback) succeeded: size={size}");
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Ascend Device Allocation (for integration tests — not used in production paths)
+// Ascend Batched Memcpy (CANN 8.5+)
 // ---------------------------------------------------------------------------
+
+/// One copy descriptor for `memcpy_batch_async`.
+#[derive(Clone, Copy)]
+pub(crate) struct BatchCopyDesc {
+    pub dst: u64,
+    pub dst_max: usize,
+    pub src: u64,
+    pub size: usize,
+}
+
+/// Enqueue a batched host→device copy on the given stream.
+///
+/// Uses `aclrtMemcpyBatchAsync` when available (CANN 8.5+), falling back
+/// to per-entry `aclrtMemcpyAsync` on older runtimes.  This matches the
+/// vllm-ascend ``swap_blocks_batch`` pattern: one kernel launch for the
+/// entire batch instead of per-block DMA overhead.
+pub fn memcpy_h2d_batch_async(
+    copies: &[BatchCopyDesc],
+    stream: &AscendDeviceStream,
+) -> Result<(), String> {
+    if copies.is_empty() {
+        return Ok(());
+    }
+    ensure_acl_initialized()?;
+
+    // Use the batch API — single aclrtMemcpyBatchAsync call.
+    let n = copies.len() as u32;
+    let dst_ptrs: Vec<*mut c_void> = copies.iter().map(|c| c.dst as *mut c_void).collect();
+    let dst_maxs: Vec<usize> = copies.iter().map(|c| c.dst_max).collect();
+    let src_ptrs: Vec<*const c_void> = copies.iter().map(|c| c.src as *const c_void).collect();
+    let sizes: Vec<usize> = copies.iter().map(|c| c.size).collect();
+
+    let ret = unsafe {
+        aclrtMemcpyBatchAsync(
+            dst_ptrs.as_ptr(),
+            dst_maxs.as_ptr(),
+            src_ptrs.as_ptr(),
+            sizes.as_ptr(),
+            n,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            stream.stream,
+        )
+    };
+
+    if ret != ACL_ERROR_NONE {
+        let desc = acl_error_description(ret);
+        // Fall back to per-copy aclrtMemcpyAsync for non-DMA-memory errors
+        if ret == ACL_ERROR_DMA_NOT_SUPPORTED {
+            return Err(format!(
+                "aclrtMemcpyBatchAsync(H2D) failed: error {ret} ({desc}). \
+                 Enable camem_allocator (COMPILE_CUSTOM_KERNELS=1) for DMA-capable \
+                 KV cache allocations."
+            ));
+        }
+        // For other errors, try per-copy fallback
+        log::warn!(
+            "aclrtMemcpyBatchAsync(H2D) failed: error {ret} ({desc}) — \
+             falling back to per-copy aclrtMemcpyAsync"
+        );
+        for copy in copies {
+            memcpy_h2d_async(copy.dst, copy.src as *const u8, copy.size, stream)?;
+        }
+    }
+    Ok(())
+}
+
+/// Enqueue a batched device→host copy on the given stream.
+///
+/// Mirrors `memcpy_h2d_batch_async` for the reverse direction.
+pub fn memcpy_d2h_batch_async(
+    copies: &[BatchCopyDesc],
+    stream: &AscendDeviceStream,
+) -> Result<(), String> {
+    if copies.is_empty() {
+        return Ok(());
+    }
+    ensure_acl_initialized()?;
+
+    let n = copies.len() as u32;
+    let dst_ptrs: Vec<*mut c_void> = copies.iter().map(|c| c.dst as *mut c_void).collect();
+    let dst_maxs: Vec<usize> = copies.iter().map(|c| c.dst_max).collect();
+    let src_ptrs: Vec<*const c_void> = copies.iter().map(|c| c.src as *const c_void).collect();
+    let sizes: Vec<usize> = copies.iter().map(|c| c.size).collect();
+
+    let ret = unsafe {
+        aclrtMemcpyBatchAsync(
+            dst_ptrs.as_ptr(),
+            dst_maxs.as_ptr(),
+            src_ptrs.as_ptr(),
+            sizes.as_ptr(),
+            n,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            stream.stream,
+        )
+    };
+
+    if ret != ACL_ERROR_NONE {
+        let desc = acl_error_description(ret);
+        if ret == ACL_ERROR_DMA_NOT_SUPPORTED {
+            return Err(format!(
+                "aclrtMemcpyBatchAsync(D2H) failed: error {ret} ({desc}). \
+                 Enable camem_allocator (COMPILE_CUSTOM_KERNELS=1) for DMA-capable \
+                 KV cache allocations."
+            ));
+        }
+        log::warn!(
+            "aclrtMemcpyBatchAsync(D2H) failed: error {ret} ({desc}) — \
+             falling back to per-copy aclrtMemcpyAsync"
+        );
+        for copy in copies {
+            memcpy_d2h_async(copy.dst as *mut u8, copy.src, copy.size, stream)?;
+        }
+    }
+    Ok(())
+}
+
+// -- Device allocation (test helpers) -------------------------------------
 
 /// Allocate device memory via `aclrtMalloc`. Returns a raw device pointer as `u64`.
 ///
@@ -452,7 +730,9 @@ pub fn malloc_device(size: usize, policy: i32) -> Result<u64, String> {
     // aclrtMalloc requires an active device context
     let ret = unsafe { aclrtSetDevice(0) };
     if ret != ACL_ERROR_NONE {
-        return Err(format!("aclrtSetDevice(0) before malloc_device({size}) failed: error code {ret}"));
+        return Err(format!(
+            "aclrtSetDevice(0) before malloc_device({size}) failed: error code {ret}"
+        ));
     }
     if size == 0 {
         return Err("aclrtMalloc: size must be > 0".into());
@@ -483,7 +763,9 @@ pub fn memcpy_h2d_sync(dst_device: u64, src_host: *const u8, size: usize) -> Res
     ensure_acl_initialized()?;
     let ret = unsafe { aclrtSetDevice(0) };
     if ret != ACL_ERROR_NONE {
-        return Err(format!("aclrtSetDevice(0) before memcpy_h2d_sync failed: error code {ret}"));
+        return Err(format!(
+            "aclrtSetDevice(0) before memcpy_h2d_sync failed: error code {ret}"
+        ));
     }
     let ret = unsafe {
         aclrtMemcpy(
@@ -547,5 +829,17 @@ mod tests {
         let device = AscendDevice::new(3).unwrap();
         let debug = format!("{device:?}");
         assert!(debug.contains("3"));
+    }
+
+    // -- Event tests (off-device smoke) ----------------------------------
+
+    /// `AscendEvent::wait` rejects a non-AscendEvent box.
+    #[test]
+    fn ascend_event_wait_rejects_wrong_type() {
+        // Box a plain integer — should fail to downcast.
+        let wrong: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        let result = AscendEvent::wait(&wrong);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not an AscendEvent"));
     }
 }

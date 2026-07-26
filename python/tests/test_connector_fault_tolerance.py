@@ -271,8 +271,8 @@ class FakeTensor:
         return 0
 
     @property
-    def device(self) -> str:
-        return "cuda:0"
+    def device(self):
+        return MagicMock(type="cuda")
 
     def stride(self) -> tuple[int, int]:
         return (16, 1)

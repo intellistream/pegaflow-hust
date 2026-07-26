@@ -233,6 +233,7 @@ impl Engine for GrpcEngineService {
             let transfer_mode = match req.transfer_mode() {
                 ProtoTransferMode::Direct => pegaflow_core::TransferMode::Direct,
                 ProtoTransferMode::Kernel => pegaflow_core::TransferMode::Kernel,
+                ProtoTransferMode::AscendDirect => pegaflow_core::TransferMode::AscendDirect,
             };
 
             // Validate array lengths are consistent with each other.
@@ -397,10 +398,18 @@ impl Engine for GrpcEngineService {
                 instance_id, tp_rank, pp_rank, device_id, layer_count, total_blocks, total_hashes
             );
 
-            self.engine
-                .batch_save_kv_blocks_from_ipc(&instance_id, tp_rank, pp_rank, device_id, saves)
-                .await
-                .map_err(Self::map_engine_error)?;
+            // Spawn the save work independently so it survives client disconnect
+            // (vLLM SIGKILL).  The connector is fire-and-forget for saves.
+            let engine = self.engine.clone();
+            let sid = instance_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = engine
+                    .batch_save_kv_blocks_from_ipc(&sid, tp_rank, pp_rank, device_id, saves)
+                    .await
+                {
+                    log::error!("Background save failed for instance {sid}: {e}");
+                }
+            });
 
             Ok(Response::new(SaveResponse {
                 status: Some(Self::build_simple_response()),
@@ -479,14 +488,16 @@ impl Engine for GrpcEngineService {
             // memory allocated via aclrtMallocPhysical (see §7.2 方案 A/B).
             // When camem_allocator is ready, this will perform native H2D DMA.
             // Until then, returns Err on Ascend (aclrtMemcpyAsync H2D → 507899).
-            self.engine.batch_load_kv_blocks_multi_layer(
-                &instance_id,
-                tp_rank,
-                device_id,
-                &load_state_shm,
-                &layer_refs,
-                &loads,
-            ).map_err(Self::map_engine_error)?;
+            self.engine
+                .batch_load_kv_blocks_multi_layer(
+                    &instance_id,
+                    tp_rank,
+                    device_id,
+                    &load_state_shm,
+                    &layer_refs,
+                    &loads,
+                )
+                .map_err(Self::map_engine_error)?;
 
             Ok(Response::new(LoadResponse {
                 status: Some(Self::build_simple_response()),

@@ -55,31 +55,26 @@ fn ascend_memcpy_d2h_h2d_roundtrip_4096() {
 
     // Write test pattern to device via sync H2D
     let src: Vec<u8> = (0..SIZE as u8).map(|i| i.wrapping_mul(3)).collect();
-    ascend::memcpy_h2d_sync(dev_ptr, src.as_ptr(), SIZE)
-        .expect("sync H2D of test pattern");
+    ascend::memcpy_h2d_sync(dev_ptr, src.as_ptr(), SIZE).expect("sync H2D of test pattern");
 
     // Allocate pinned host memory
-    let (host_ptr, _device_ptr) =
-        ascend::malloc_host(SIZE).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(SIZE).expect("aclrtMallocHost");
 
     // Create stream for async operations
     let stream = device.create_stream().expect("create stream");
 
     // Async D2H
-    ascend::memcpy_d2h_async(host_ptr, dev_ptr, SIZE, &stream)
-        .expect("async D2H");
+    ascend::memcpy_d2h_async(host_ptr, dev_ptr, SIZE, &stream).expect("async D2H");
 
     // Synchronize the stream — CRITICAL for data consistency
     stream.synchronize().expect("stream sync after D2H");
 
     // Fill source with garbage before H2D to prove we're reading from host
     let garbage: Vec<u8> = vec![0xCD; SIZE];
-    ascend::memcpy_h2d_sync(dev_ptr, garbage.as_ptr(), SIZE)
-        .expect("sync H2D of garbage");
+    ascend::memcpy_h2d_sync(dev_ptr, garbage.as_ptr(), SIZE).expect("sync H2D of garbage");
 
     // Now copy original data back to device via async H2D
-    ascend::memcpy_h2d_async(dev_ptr, host_ptr, SIZE, &stream)
-        .expect("async H2D");
+    ascend::memcpy_h2d_async(dev_ptr, host_ptr, SIZE, &stream).expect("async H2D");
 
     stream.synchronize().expect("stream sync after H2D");
 
@@ -89,11 +84,7 @@ fn ascend_memcpy_d2h_h2d_roundtrip_4096() {
         .expect("sync D2H for verification");
 
     // Assert roundtrip data integrity
-    assert_eq!(
-        &src[..],
-        &verify_buf[..],
-        "D2H→H2D roundtrip data mismatch"
-    );
+    assert_eq!(&src[..], &verify_buf[..], "D2H→H2D roundtrip data mismatch");
 
     // Cleanup
     ascend::free_host(host_ptr).ok();
@@ -127,13 +118,11 @@ fn ascend_memcpy_stress_10k_small() {
         }
     };
 
-    let (host_ptr, _device_ptr) =
-        ascend::malloc_host(SIZE).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(SIZE).expect("aclrtMallocHost");
     let stream = device.create_stream().expect("create stream");
 
     let src_pattern: Vec<u8> = (0..SIZE as u8).map(|i| i.wrapping_add(0x55)).collect();
-    ascend::memcpy_h2d_sync(dev_ptr, src_pattern.as_ptr(), SIZE)
-        .expect("initial H2D");
+    ascend::memcpy_h2d_sync(dev_ptr, src_pattern.as_ptr(), SIZE).expect("initial H2D");
 
     for i in 0..ITERATIONS {
         // D2H async → synchronize
@@ -153,8 +142,7 @@ fn ascend_memcpy_stress_10k_small() {
 
     // Final verification
     let mut verify_buf = vec![0u8; SIZE];
-    ascend::memcpy_d2h_sync(verify_buf.as_mut_ptr(), dev_ptr, SIZE)
-        .expect("final sync D2H");
+    ascend::memcpy_d2h_sync(verify_buf.as_mut_ptr(), dev_ptr, SIZE).expect("final sync D2H");
     assert_eq!(
         &src_pattern[..],
         &verify_buf[..],
@@ -284,7 +272,7 @@ fn ascend_transfer_backend_roundtrip() {
         size: SIZE,
     };
 
-    let backend = AscendMemcpyBackend;
+    let backend = AscendMemcpyBackend::new(0);
 
     // Execute D2H via backend
     backend.d2h(&[desc], &stream).expect("backend d2h");
@@ -355,7 +343,7 @@ fn ascend_transfer_backend_coalesced() {
         },
     ];
 
-    let backend = AscendMemcpyBackend;
+    let backend = AscendMemcpyBackend::new(0);
 
     // D2H both segments
     backend.d2h(&descs, &stream).expect("backend d2h coalesced");
@@ -369,7 +357,11 @@ fn ascend_transfer_backend_coalesced() {
 
     let mut verify = vec![0u8; TOTAL];
     ascend::memcpy_d2h_sync(verify.as_mut_ptr(), dev_ptr, TOTAL).expect("verify D2H");
-    assert_eq!(&src[..], &verify[..], "coalesced backend roundtrip mismatch");
+    assert_eq!(
+        &src[..],
+        &verify[..],
+        "coalesced backend roundtrip mismatch"
+    );
 
     ascend::free_host(host_ptr).ok();
     ascend::free_device(dev_ptr).ok();

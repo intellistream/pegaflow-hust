@@ -63,13 +63,29 @@ class PegaKVConnector(KVConnectorBase_V1):
                 dcp_world_size,
             )
 
+        # vLLM uses a per-process random NONE_HASH (os.urandom(32)) as the
+        # first block's parent hash when PYTHONHASHSEED is not set.  This
+        # makes every vLLM instance produce different block_hashes for the
+        # same tokens, breaking cross-instance KV cache sharing.  Warn users
+        # early so they can fix their deployment before wasting cache budget.
+        if not os.environ.get("PYTHONHASHSEED"):
+            logger.warning(
+                "[PegaKVConnector] PYTHONHASHSEED is not set — vLLM's block "
+                "hashes will be per-process random (the NONE_HASH is seeded "
+                "from os.urandom(32)).  Cross-instance KV cache sharing will "
+                "NOT work.  Set PYTHONHASHSEED=0 (or any fixed value) in all "
+                "vLLM instances that should share KV cache through PegaFlow."
+            )
+
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        namespace_override = os.environ.get("PEGAFLOW_NAMESPACE")
         namespace = derive_namespace(
             vllm_config,
             effective_tp_size,
             dcp_world_size,
             pcp_world_size,
             cross_layer_blocks=cross_layer_blocks,
+            override=namespace_override,
         )
         block_size = vllm_config.cache_config.block_size
 
@@ -395,12 +411,28 @@ class NoopKVConnector(KVConnectorBase_V1):
 def _resolve_device_id() -> int:
     """Return the global device id even when visibility env vars mask devices.
 
-    Handles CUDA_VISIBLE_DEVICES. Falls back to local index when no visibility
-    masking is active.
+    Handles CUDA_VISIBLE_DEVICES and ASCEND_RT_VISIBLE_DEVICES.  Falls back
+    to local index when no visibility masking is active.  Checks CUDA first,
+    then Ascend NPU, then returns 0 as a safe default.
+
+    Set PEGAFLOW_DEVICE_ID to an integer to bypass auto-detection entirely
+    (useful when both server and client share the same visibility mask via
+    ASCEND_RT_VISIBLE_DEVICES and the connector should report the local index).
     """
+    override = os.environ.get("PEGAFLOW_DEVICE_ID")
+    if override is not None:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+
     if torch.cuda.is_available():
         local_id = torch.cuda.current_device()
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        return _map_device(local_id, visible)
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        local_id = torch.npu.current_device()
+        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
         return _map_device(local_id, visible)
     return 0
 
@@ -419,4 +451,10 @@ def _map_device(local_id: int, visible: str | None) -> int:
         return local_id
 
 
-__all__ = ["PegaKVConnector", "NoopKVConnector", "KVConnectorRole"]
+__all__ = [
+    "PegaKVConnector",
+    "NoopKVConnector",
+    "KVConnectorRole",
+    "_map_device",
+    "_resolve_device_id",
+]

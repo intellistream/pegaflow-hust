@@ -58,8 +58,7 @@ pub(crate) fn preflight() -> Result<(), AscendVersionError> {
         return Err(AscendVersionError(format!(
             "Ascend version mismatch: minimum required {}.{}.{}, detected {}.{}.{}. \
              Upgrade CANN toolkit to >= 8.5.0.",
-            MIN_MAJOR, MIN_MINOR, MIN_PATCH,
-            major, minor, patch
+            MIN_MAJOR, MIN_MINOR, MIN_PATCH, major, minor, patch
         )));
     }
 

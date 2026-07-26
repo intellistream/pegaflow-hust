@@ -2,6 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::collections::{HashMap, HashSet};
+use std::mem::ManuallyDrop;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -16,17 +17,12 @@ struct LayerTensor {
         dead_code,
         reason = "holding the Python tensor keeps device memory mapped"
     )]
-    tensor: Py<PyAny>,
+    // ManuallyDrop: prevent Py<PyAny> Drop from running torch's tp_dealloc,
+    // which calls npuSynchronizeDevice → can throw c10::Error (507001) if
+    // the device has zombie tasks from a SIGKILLed vLLM process.
+    tensor: ManuallyDrop<Py<PyAny>>,
     metadata: TensorMetadata,
 }
-
-// Note: No custom Drop impl needed for LayerTensor.
-// PyO3's Py<PyAny> will automatically:
-// 1. Acquire the GIL when dropped
-// 2. Decrement the Python object's reference count
-// 3. Let Python's garbage collector handle the actual cleanup
-// This is the correct way to release IPC tensors — the mapped memory
-// will be released when the tensor's storage is garbage collected.
 
 struct ContextState {
     device_id: i32,
@@ -162,17 +158,6 @@ impl CudaTensorRegistry {
             for key in &keys {
                 self.contexts.remove(key);
             }
-
-            let gc = py.import("gc").expect("gc module");
-            let _ = gc.call_method0("collect");
-
-            let torch = py.import("torch").expect("torch module");
-            if let Ok(npu) = torch.getattr("npu") {
-                let _ = npu.call_method0("empty_cache");
-            }
-            if let Ok(cuda) = torch.getattr("cuda") {
-                let _ = cuda.call_method0("empty_cache");
-            }
         });
 
         tensor_count
@@ -208,7 +193,7 @@ impl CudaTensorRegistry {
             let tensor_owned = tensor.unbind();
 
             Ok(LayerTensor {
-                tensor: tensor_owned,
+                tensor: ManuallyDrop::new(tensor_owned),
                 metadata: TensorMetadata {
                     data_ptr,
                     size_bytes,

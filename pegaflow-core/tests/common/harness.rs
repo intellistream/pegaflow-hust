@@ -337,7 +337,6 @@ impl TestEnv {
                 0,
                 0,
                 vec![LayerSave {
-                
                     layer_name: layer.name.clone(),
                     block_ids,
                     block_hashes: hashes.to_vec(),
@@ -369,7 +368,6 @@ impl TestEnv {
             .layers
             .iter()
             .map(|layer| LayerSave {
-                
                 layer_name: layer.name.clone(),
                 block_ids: (0..hashes.len()).collect(),
                 block_hashes: hashes.to_vec(),

@@ -167,7 +167,6 @@ impl BenchFixture {
                 0,
                 DEVICE_ID,
                 vec![LayerSave {
-                
                     layer_name: LAYER_NAME.to_string(),
                     block_ids: self.block_ids.clone(),
                     block_hashes: hashes,
@@ -353,7 +352,6 @@ impl MultiLayerBenchFixture {
         self.layer_names
             .iter()
             .map(|layer_name| LayerSave {
-                
                 layer_name: layer_name.clone(),
                 block_ids: ids.clone(),
                 block_hashes: hashes.to_vec(),

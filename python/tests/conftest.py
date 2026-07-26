@@ -627,7 +627,7 @@ def pytest_addoption(parser):
         "--pegaflow-transfer-backend",
         action="store",
         default="direct",
-        choices=("direct", "kernel"),
+        choices=("direct", "kernel", "ascend_direct"),
         help="PegaFlow server H2D/D2H transfer backend for E2E tests",
     )
     parser.addoption(
@@ -654,3 +654,84 @@ def pytest_configure(config):
         "markers",
         "e2e: marks tests as end-to-end tests (require vLLM + PegaFlow)",
     )
+    config.addinivalue_line(
+        "markers",
+        "npu: marks tests that require Ascend NPU hardware",
+    )
+    config.addinivalue_line(
+        "markers",
+        "npu_multi: marks multi-instance NPU tests that need >=2 NPU devices",
+    )
+
+
+# =============================================================================
+# NPU / Ascend Fixtures
+# =============================================================================
+
+
+@pytest.fixture(scope="session")
+def npu_available() -> bool:
+    """Check if Ascend NPU hardware is available in this environment.
+
+    Returns True when ``torch.npu`` is importable and reports at least one
+    device.  Tests decorated with ``@pytest.mark.npu`` should call this
+    fixture and skip if it returns False.
+    """
+    try:
+        import torch
+
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except ImportError:
+        return False
+
+
+@pytest.fixture(scope="session")
+def npu_device_count() -> int:
+    """Return the number of available Ascend NPU devices."""
+    try:
+        import torch
+
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return torch.npu.device_count()
+    except ImportError:
+        pass
+    return 0
+
+
+@pytest.fixture
+def npu_device(npu_available):
+    """Fixture that provides an NPU device, skipping if unavailable."""
+    if not npu_available:
+        pytest.skip("Ascend NPU not available")
+    import torch
+
+    return torch.device("npu:0")
+
+
+@pytest.fixture
+def camem_kv_cache_allocator(npu_available):
+    """Fixture providing a camem-allocator-backed memory pool for NPU tests.
+
+    When camem_allocator is available (vllm_ascend_C), this yields a context
+    manager that allocates DMA-capable NPU tensors suitable for PegaFlow
+    save/load operations.  Falls back to standard ``torch.npu`` allocation
+    with a warning if camem is not available.
+    """
+    if not npu_available:
+        pytest.skip("Ascend NPU not available")
+
+    try:
+        from vllm_ascend.device_allocator.camem import CaMemAllocator
+
+        allocator = CaMemAllocator.get_instance()
+        yield allocator
+    except ImportError:
+        # camem_allocator not available — standard NPU allocations will fail
+        # D2H with error 507899.  Tests using this fixture should check
+        # result and skip save/load portions.
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "camem_allocator (vllm_ascend_C) not available — "
+            "PegaFlow D2H memcpy may fail with CANN error 507899."
+        )
+        yield None

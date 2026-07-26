@@ -189,7 +189,7 @@ impl PinnedMemoryPool {
                     "Allocating pinned memory pool with aclrtMallocHost on {} (SSD enabled)",
                     node
                 );
-                Self::allocate_ascend_host_fallback(pool_size)
+                Self::allocate_ascend_host_fallback(pool_size, node)
             }
         } else {
             #[cfg(feature = "cuda")]
@@ -201,7 +201,7 @@ impl PinnedMemoryPool {
             #[cfg(not(feature = "cuda"))]
             {
                 info!("Allocating pinned memory pool with aclrtMallocHost mapped pages");
-                Self::allocate_ascend_host_fallback(pool_size)
+                Self::allocate_ascend_host_fallback(pool_size, node)
             }
         };
 
@@ -250,10 +250,20 @@ impl PinnedMemoryPool {
     }
 
     /// Fallback allocation using Ascend's `aclrtMallocHost` when CUDA is not available.
+    ///
+    /// Resolves the best NPU device for the given NUMA node, falling back to
+    /// device 0 when the NUMA→device mapping is unknown.
     #[cfg(all(feature = "ascend", not(feature = "cuda")))]
-    fn allocate_ascend_host_fallback(size: usize) -> PinnedMemory {
+    fn allocate_ascend_host_fallback(size: usize, node: NumaNode) -> PinnedMemory {
         use crate::pinned_mem::PinnedMemory;
-        PinnedMemory::allocate_ascend_host(size)
+        // Resolve device_id from NUMA node via the topology cache.
+        // When NUMA info is unavailable, default to device 0 (single-NPU systems).
+        let device_id = crate::topology::resolve_device_for_numa(node);
+        info!(
+            "Ascend pinned pool on NUMA node {} → using device {}",
+            node, device_id
+        );
+        PinnedMemory::allocate_ascend_host(device_id, size)
             .expect("Failed to allocate Ascend pinned memory pool via aclrtMallocHost")
     }
 

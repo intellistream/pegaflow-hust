@@ -9,6 +9,7 @@
 
 #[macro_use]
 mod trace;
+mod topology;
 
 mod allocator;
 mod backing;
@@ -60,7 +61,9 @@ use std::{
 use log::{debug, info};
 
 use crate::backing::SSD_ALIGNMENT;
-use crate::gpu_worker::{HostBlock, LayerTransferData, LoadCompletion, LoadTask, TransferBlock};
+use crate::gpu_worker::{
+    GpuWorkerPool, HostBlock, LayerTransferData, LoadCompletion, LoadTask, TransferBlock,
+};
 use crate::lease::QueryLeaseManager;
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
@@ -127,6 +130,8 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
     /// Query-ready blocks owned by opaque scheduler leases.
     query_leases: QueryLeaseManager,
+    /// Per-device GPU worker pools (survive instance unregistration).
+    gpu_pools: std::sync::Mutex<HashMap<i32, Arc<GpuWorkerPool>>>,
 }
 
 impl PegaEngine {
@@ -141,6 +146,9 @@ impl PegaEngine {
     ) -> Result<Self, EngineError> {
         let topology = Arc::new(NumaTopology::detect());
         topology.log_summary();
+        // Cache the device→NUMA mapping so Ascend pinned-memory pool creation
+        // can resolve which NPU device to activate for each NUMA node.
+        topology::init_device_numa_map(topology.device_numa_map());
 
         let config = storage_config;
         let numa_nodes: Vec<NumaNode> = if config.enable_numa_affinity && topology.is_multi_numa() {
@@ -171,7 +179,31 @@ impl PegaEngine {
             storage,
             topology,
             query_leases: QueryLeaseManager::default(),
+            gpu_pools: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Get or create the global GPU worker pool for a device.
+    /// The pool survives instance unregistration so pending saves can drain.
+    fn get_or_create_gpu_pool(
+        &self,
+        device_id: i32,
+        numa_node: NumaNode,
+        transfer_mode: TransferMode,
+    ) -> Result<Arc<GpuWorkerPool>, EngineError> {
+        let mut pools = self.gpu_pools.lock().unwrap();
+        if let Some(pool) = pools.get(&device_id) {
+            return Ok(Arc::clone(pool));
+        }
+        let device_ctx = InstanceContext::build_device_context_static(device_id)?;
+        let pool = Arc::new(GpuWorkerPool::spawn(
+            device_id,
+            device_ctx,
+            numa_node,
+            transfer_mode,
+        )?);
+        pools.insert(device_id, Arc::clone(&pool));
+        Ok(pool)
     }
 
     /// Get or create an instance with the specified topology.
@@ -400,16 +432,22 @@ impl PegaEngine {
             )));
         }
 
-        // Register GPU with all layers. The connector picks the backend per
-        // model and sends it with the registration.
-        instance.register_new_gpu(GpuRegistration {
-            device_id,
-            tp_rank,
-            pp_rank,
-            numa_node,
-            transfer_mode,
-            kv_caches,
-        })?;
+        // Get or create the global GPU worker pool for this device.
+        // The pool survives instance unregistration so pending saves drain.
+        let worker_pool = self.get_or_create_gpu_pool(device_id, numa_node, transfer_mode)?;
+
+        // Register GPU with all layers.
+        instance.register_new_gpu(
+            GpuRegistration {
+                device_id,
+                tp_rank,
+                pp_rank,
+                numa_node,
+                transfer_mode,
+                kv_caches,
+            },
+            worker_pool,
+        )?;
 
         info!(
             "Registered context batch: instance={instance_id}, namespace={namespace}, \

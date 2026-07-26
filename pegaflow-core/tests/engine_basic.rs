@@ -74,7 +74,6 @@ async fn page_first_rejects_partial_layer_save() {
 
     // Submit only layer_a — a partial page that must not seal.
     let partial = vec![LayerSave {
-                
         layer_name: env.layers[0].name.clone(),
         block_ids: (0..hashes.len()).collect(),
         block_hashes: hashes.clone(),

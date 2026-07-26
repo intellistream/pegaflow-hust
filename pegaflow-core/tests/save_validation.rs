@@ -22,7 +22,6 @@ async fn save_rejects_mismatched_block_id_and_hash_lengths() {
             0,
             0,
             vec![LayerSave {
-                
                 layer_name: "layer_0".to_string(),
                 block_ids: vec![0, 1],
                 block_hashes: vec![vec![9u8]],
@@ -56,7 +55,6 @@ async fn save_rejects_device_group_mismatch() {
             0,
             0,
             vec![LayerSave {
-                
                 layer_name: "layer_0".to_string(),
                 block_ids: vec![0],
                 block_hashes: vec![hashes[0].clone()],
@@ -73,7 +71,6 @@ async fn save_rejects_device_group_mismatch() {
             1,
             0,
             vec![LayerSave {
-                
                 layer_name: "layer_0".to_string(),
                 block_ids: vec![1],
                 block_hashes: vec![hashes[1].clone()],

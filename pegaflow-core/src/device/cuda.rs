@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaStream, CudaEvent};
+use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
 
 /// CUDA device handle wrapping a `cudarc::driver::CudaContext`.
 #[derive(Debug, Clone)]
@@ -19,10 +19,7 @@ impl CudaDevice {
     pub fn new(device_id: i32) -> Result<Self, String> {
         let ctx = CudaContext::new(device_id as usize)
             .map_err(|e| format!("CudaContext::new(device {device_id}) failed: {e:?}"))?;
-        Ok(Self {
-            ctx: Arc::new(ctx),
-            device_id,
-        })
+        Ok(Self { ctx, device_id })
     }
 
     /// Access the underlying CUDA context.

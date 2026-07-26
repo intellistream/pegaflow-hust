@@ -176,7 +176,7 @@ npu_ipc_import_key(PyObject *self, PyObject *args)
 /*
  * close_key(key: bytes) -> None
  *
- * Release a CANN IPC key. Idempotent; safe to call multuple times.
+ * Release a CANN IPC key. Idempotent; safe to call multiple times.
  */
 static PyObject *
 npu_ipc_close_key(PyObject *self, PyObject *args)
