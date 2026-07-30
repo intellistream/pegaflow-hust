@@ -7,3 +7,7 @@ CANN = "CANN"
 Som = "Som"
 # Bash variable in benchmark scripts (short for SAVE)
 SAV = "SAV"
+# Benchmark metrics / abbreviations
+TTFT = "TTFT"
+gmu = "gmu"
+tok = "tok"
