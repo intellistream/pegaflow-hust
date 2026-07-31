@@ -297,6 +297,28 @@ class NpuIPCWrapper:
             and self.device_index == other.device_index
         )
 
+    def close(self) -> None:
+        """Release the CANN IPC import, freeing NPU HBM held by the remote
+        process that imported this memory region.
+
+        After close() the wrapper cannot create new tensors but existing
+        tensors remain valid until dropped.
+        """
+        if not hasattr(self, "_handle") or not self._handle:
+            return
+        # self._handle = (device_id, export_key, ...) from _share_npu_()
+        # The export key is the second element.
+        key = self._handle[1]
+        if key:
+            _npu_ipc_close(key)
+        self._handle = ()
+
+    def __del__(self) -> None:
+        """Auto-close on GC to prevent IPC memory leaks."""
+        import contextlib
+        with contextlib.suppress(Exception):
+            self.close()
+
     def __repr__(self) -> str:
         has_handle = hasattr(self, "_handle") and bool(getattr(self, "_handle", None))
         return (

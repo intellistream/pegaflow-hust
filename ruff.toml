@@ -5,9 +5,10 @@ extend-exclude = [
     "target/",
     ".github/",
     "pegaflow-core/",
-    # Benchmark/diagnostic scripts — not production code
-    "diag_block_hash.py",
-    "run_npu_benchmark.py",
+    # Benchmark scripts — not production code
+    "run_bench_8inst.py",
+    "run_bench_8inst_concurrent.py",
+    "run_bench_mla_tp8_concurrent.py",
     # Upstream scripts with pre-existing issues
     "scripts/",
 ]

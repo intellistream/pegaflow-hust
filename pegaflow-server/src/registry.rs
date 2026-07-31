@@ -151,12 +151,30 @@ impl CudaTensorRegistry {
             return 0;
         }
 
-        // Remove contexts under the GIL so each `Py<PyAny>` is dropped (decref)
-        // there, then force gc + device cache flush to actually release the IPC
-        // memory immediately instead of letting Python's GC defer it.
+        // Remove contexts and explicitly drop tensors under the GIL.
+        // LayerTensor uses ManuallyDrop to avoid npuSynchronizeDevice in
+        // Drop, but that also prevents Py<PyAny>::drop() from decref-ing,
+        // leaking IPC imports on CANN.  We collect all tensors here, take
+        // them out of ManuallyDrop, and drop them inside Python::attach.
+        let mut pending: Vec<Py<PyAny>> = Vec::with_capacity(tensor_count);
+        for key in &keys {
+            if let Some(ctx) = self.contexts.remove(key) {
+                for (_, lt) in ctx.tensors {
+                    // Safety: take the inner Py<PyAny> out of ManuallyDrop
+                    let tensor: Py<PyAny> = ManuallyDrop::into_inner(lt.tensor);
+                    pending.push(tensor);
+                }
+            }
+        }
         Python::attach(|py| {
-            for key in &keys {
-                self.contexts.remove(key);
+            // Drop all tensors — this decrefs and triggers tp_dealloc
+            // which calls aclrtIpcMemClose to release IPC imports.
+            drop(pending);
+            if let Ok(gc) = py.import("gc") {
+                let _ = gc.call_method0("collect");
+            }
+            if let Ok(npu) = py.import("torch_npu") {
+                let _ = npu.call_method0("synchronize");
             }
         });
 
