@@ -9,6 +9,9 @@ extend-exclude = [
     "run_bench_8inst.py",
     "run_bench_8inst_concurrent.py",
     "run_bench_mla_tp8_concurrent.py",
+    "run_trace_audit.py",
+    # Trace artifacts — log data, not Python
+    "results/",
     # Upstream scripts with pre-existing issues
     "scripts/",
 ]
