@@ -17,6 +17,17 @@
 - **Production-ready observability** — built-in Prometheus metrics and OTLP export, not an afterthought
 - **Pluggable** — works with vLLM as a drop-in KV connector
 
+## Research ownership
+
+Chen Zijia (`@mynameisczj`) and Chen Yanbo (`@cybber695`) jointly advance the
+Ascend research path in this repository. Chen Zijia focuses on transfer-side
+packing, layout, operator, and PTO/PyPTO opportunities; Chen Yanbo focuses on
+serving integration, KV lifecycle correctness, and end-to-end evaluation.
+PegaFlow remains independently maintained from their other projects. If its
+results later support the same paper as another carrier, the evidence may be
+combined at the paper-family level without merging repositories or claim
+ledgers.
+
 ## News
 
 - **2026-05-18** — [vLLM x Novita AI: PegaFlow for Production-Grade External KV Cache](https://vllm.ai/blog/2026-05-18-pegaflow), a joint blog post with the vLLM team.
