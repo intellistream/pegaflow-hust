@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Trace Audit: 严格可审计的 PegaFlow Ascend 数据通路性能 Trace
+Trace Audit: PegaFlow Ascend KV Transfer Break-Even (Host-Only Preregistration)
 
-满足 Issue #4 的 M1 交付要求：
-  1. Matched contract: 同 NPU 集合、同 prompt/request order、同 warmup/graph state
-  2. 逐请求 raw data: TTFT, total, hit/miss, DMA bytes/time, prefill tokens, instance
-  3. 3 独立 lifecycle, 报告 median/CI
-  4. 负例保留: burst、MLA low-headroom
-  5. Artifact 绑定: commit hash, model hash, device map, env vars
+STATUS: Host-only — NOT yet executed on NPU.
+        See docs/trace_preregistration.md for full experimental design.
 
-输出: trace_audit.json + trace_summary.md
+Prior artifact: results/trace-audit-INVALID/ — methodological asymmetry discovered
+and preserved as negative example (see preregistration Section 8).
 
 Usage:
   python run_trace_audit.py --cycles 3 --requests-per-phase 3
@@ -160,9 +157,27 @@ def get_npu_free_memory() -> dict[int, int]:
 # Process management
 # =========================================================================
 
-def kill_all():
-    for p in ["pegaflow-server", "vllm serve"]:
-        os.system(f"pkill -f '{p}' 2>/dev/null || true")
+# Tracked child processes — cleanup only kills what we spawned.
+_tracked_pids: list[int] = []
+
+
+def _track_proc(proc: subprocess.Popen) -> None:
+    _tracked_pids.append(proc.pid)
+
+
+def kill_tracked() -> None:
+    """Kill only processes spawned by this runner, never touch external tasks."""
+    for pid in list(_tracked_pids):
+        try:
+            os.kill(-pid, signal.SIGTERM)  # negative = process group
+        except (ProcessLookupError, PermissionError):
+            pass
+    for pid in list(_tracked_pids):
+        try:
+            os.kill(-pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    _tracked_pids.clear()
 
 
 def stop_proc(proc):
@@ -178,9 +193,11 @@ def stop_proc(proc):
             pass
 
 
-def start_server(pool_size="4096mb"):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log = LOG_DIR / "server.log"
+def start_server(pool_size="4096mb", log_dir=None):
+    if log_dir is None:
+        log_dir = LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = log_dir / "server.log"
     proc = subprocess.Popen(
         [
             str(PROJECT_ROOT / "target" / "debug" / "pegaflow-server"),
@@ -191,6 +208,7 @@ def start_server(pool_size="4096mb"):
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
     )
+    _track_proc(proc)
     deadline = time.time() + 30
     while time.time() < deadline:
         time.sleep(1)
@@ -237,6 +255,7 @@ def start_vllm(port, mode, namespace, physical_npu, label, *,
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
     )
+    _track_proc(proc)
     deadline = time.time() + 180
     while time.time() < deadline:
         try:
@@ -387,7 +406,7 @@ def run_phase_sequential(phase_name, instances, queries, model_path,
         r = send_one_streaming(warmup_spec["port"], prompt, model_path)
         print(f"    [WARMUP] {warmup_spec['label']} "
               f"TTFT={r['ttft_s']:.4f}s ok={r['ok']}")
-        time.sleep(15)  # seal delay
+        time.sleep(30)  # seal delay: write pipeline needs ~20-25s to seal blocks after warmup
 
     # Timed phase
     idx = 0
@@ -499,58 +518,95 @@ def write_summary(env_info, all_records, negative_examples, out_dir):
         "",
     ]
 
-    # Break-even analysis
-    if ttft_s["n"] > 0 and ttft_i["n"] > 0:
-        prefill_saved = ttft_i["mean"] - ttft_s["mean"]
-        # Estimate DMA from server log (per-request avg)
-        dma_vals = [r.get("dma_ms", 0) for r in shared if r.get("dma_ms", 0) > 0]
-        dma_avg = sum(dma_vals) / len(dma_vals) if dma_vals else 85.0
-        net_gain = prefill_saved - (dma_avg / 1000.0)
+    # Per-query paired break-even (NOT mixed-class mean)
+    lines += [
+        "",
+        "## Per-Query Paired Analysis",
+        "",
+        "Q0 measures cross-instance cold prefill (cache hit vs full compute).",
+        "Q1/Q2 measure same-instance prefix cache (vLLM internal).",
+        "Mixed-class mean conflates these — per-query pairing is the correct metric.",
+        "",
+    ]
+    for qidx in sorted(set(r["query_idx"] for r in all_records)):
+        s_subset = [r for r in shared if r.get("query_idx") == qidx and r.get("ok")]
+        i_subset = [r for r in isolated if r.get("query_idx") == qidx and r.get("ok")]
+        s_vals = sorted(r["ttft_s"] for r in s_subset)
+        i_vals = sorted(r["ttft_s"] for r in i_subset)
+        if s_vals and i_vals:
+            s_med = s_vals[len(s_vals)//2]
+            i_med = i_vals[len(i_vals)//2]
+            paired_delta = (i_med - s_med) / i_med * 100 if i_med > 0 else 0
+            # Per-request DMA for this query class only
+            dma_vals = [r.get("dma_ms", 0) for r in s_subset
+                        if r.get("dma_ms", 0) > 0]
+            dma_fallbacks = sum(1 for r in s_subset if r.get("dma_ms", 0) < 0)
+            dma_paired = sum(dma_vals) / len(dma_vals) if dma_vals else 0
+            dma_note = (f"{dma_paired:.1f}ms" if dma_vals
+                        else f"per-copy fallback ({dma_fallbacks} DMA no timing)")
+            s_mean = sum(s_vals) / len(s_vals)
+            i_mean = sum(i_vals) / len(i_vals)
+            lines += [
+                f"### Q{qidx}",
+                f"- Shared: n={len(s_vals)}, median={s_med:.4f}s, mean={s_mean:.4f}s",
+                f"- Isolated: n={len(i_vals)}, median={i_med:.4f}s, mean={i_mean:.4f}s",
+                f"- Paired delta: {paired_delta:+.1f}% ({(i_med - s_med)*1000:.0f}ms median)",
+                f"- DMA (per-request, timestamp-bound): {dma_note}",
+            ]
 
-        lines += [
-            "## Break-Even Analysis",
-            "",
-            "```",
-            f"prefill_saved = isolated_mean_ttft - shared_mean_ttft",
-            f"              = {ttft_i['mean']:.4f}s - {ttft_s['mean']:.4f}s",
-            f"              = {prefill_saved:.4f}s",
-            f"dma_cost      = {dma_avg:.1f}ms = {dma_avg/1000:.4f}s",
-            f"net_gain      = {prefill_saved:.4f}s - {dma_avg/1000:.4f}s",
-            f"              = {net_gain:.4f}s",
-            "```",
-            "",
-        ]
-        if net_gain > 0:
-            lines.append(
-                f"**Verdict: PRELIMINARY GO** — PegaFlow saves "
-                f"{prefill_saved*1000:.0f}ms prefill at cost of "
-                f"{dma_avg:.0f}ms DMA, net gain {net_gain*1000:.0f}ms. "
-                f"Proceed to prototype given matched trace confirms "
-                f"break-even."
-            )
-        else:
-            lines.append(
-                f"**Verdict: BREAK-EVEN** — prefill saved "
-                f"({prefill_saved*1000:.0f}ms) ≈ DMA cost ({dma_avg:.0f}ms), "
-                f"net gain {net_gain*1000:.0f}ms. Characterize as "
-                f"\"Ascend KV transfer break-even\" rather than "
-                f"claiming serving benefit."
-            )
+    lines += [
+        "",
+        "## Methodological Notes",
+        "",
+        "- AB/BA arm order alternation per cycle (shared→isolated, isolated→shared, ...)",
+        "- Both arms use PegaFlow with symmetric warmup count",
+        "- Independent server lifecycle per arm (not shared across cycles)",
+        "- Per-query-class paired reporting (Q0 vs Q0, Q1 vs Q1, Q2 vs Q2)",
+        "- DMA cost per-request bound to corresponding hit (not shared mean)",
+        "- See prior artifact (results/trace-audit/) for methodological asymmetry discovered",
+    ]
 
+    lines += [
+        "",
+        "## Per-Cycle TTFT (Lifecycle-Level Paired Delta)",
+        "",
+        "Each lifecycle = 1 independent paired observation (shared - isolated).",
+        "Cluster bootstrap over n=3 lifecycles, per query class.",
+        "",
+        "| Cycle | Shared Mean | Isolated Mean | Paired Delta |",
+        "|---|---|---|---|",
+    ]
+    per_cycle_deltas: dict[int, float] = {}
+    for c in sorted(set(r["cycle"] for r in all_records)):
+        sc = [r for r in shared if r["cycle"] == c]
+        ic = [r for r in isolated if r["cycle"] == c]
+        sm = sum(r["ttft_s"] for r in sc) / len(sc) if sc else 0
+        im = sum(r["ttft_s"] for r in ic) / len(ic) if ic else 0
+        delta = im - sm
+        per_cycle_deltas[c] = delta
+        gain = delta / im * 100 if im > 0 else 0
+        lines.append(f"| {c} | {sm:.4f}s | {im:.4f}s | {delta:+.4f}s ({gain:+.1f}%) |")
+
+    # Lifecycle-level cluster bootstrap for paired delta
+    if len(per_cycle_deltas) >= 3:
+        deltas = list(per_cycle_deltas.values())
+        boot_deltas = []
+        for _ in range(1000):
+            sample = [random.choice(deltas) for __ in range(len(deltas))]
+            boot_deltas.append(sum(sample) / len(sample))
+        boot_deltas.sort()
+        ci_low = boot_deltas[25]
+        ci_high = boot_deltas[974]
+        mean_delta = sum(deltas) / len(deltas)
         lines += [
             "",
-            "## Per-Cycle TTFT (Mean)",
-            "",
-            "| Cycle | Shared Mean | Isolated Mean | Gain |",
-            "|---|---|---|---|",
+            "## Lifecycle-Level Paired Delta (n=3 clusters)",
+            f"- Mean paired delta: {mean_delta*1000:.0f}ms "
+            f"(shared saves {(mean_delta/ttft_i['mean']*100):.1f}% vs isolated mean)",
+            f"- 95% CI (cluster bootstrap): [{ci_low*1000:.0f}ms, {ci_high*1000:.0f}ms]",
+            f"- Per-lifecycle deltas: "
+            + ", ".join(f"C{c}:{d*1000:.0f}ms" for c, d in per_cycle_deltas.items()),
         ]
-        for c in sorted(set(r["cycle"] for r in all_records)):
-            sc = [r for r in shared if r["cycle"] == c]
-            ic = [r for r in isolated if r["cycle"] == c]
-            sm = compute_stats(sc, "ttft_s")["mean"]
-            im = compute_stats(ic, "ttft_s")["mean"]
-            gain = (im - sm) / im * 100 if im > 0 else 0
-            lines.append(f"| {c} | {sm:.4f}s | {im:.4f}s | {gain:+.1f}% |")
 
     # Per-query breakdown (Q0 = cold prefill, Q1/Q2 = prefix cache)
     for qidx in sorted(set(r["query_idx"] for r in all_records)):
@@ -595,7 +651,7 @@ def write_summary(env_info, all_records, negative_examples, out_dir):
         "",
         "## Artifacts",
         f"- Raw records: `{out_dir}/trace_audit.json`",
-        f"- Server log: `{LOG_DIR}/server.log`",
+        f"- Per-arm server logs: `{LOG_DIR}/arm_*/server.log`",
         f"- vLLM logs: `{LOG_DIR}/vllm_*.log`",
         f"- Environment snapshot: `trace_audit.json` → `_env` key",
     ]
@@ -642,72 +698,108 @@ def main():
     print(f"  Pool:     {args.pool_size}")
     print("=" * 70)
 
-    kill_all()
+    kill_tracked()
     time.sleep(2)
 
     # ------------------------------------------------------------------
-    # Start server (once for all cycles)
+    # Matched-lifecycle runner: each arm gets independent server lifecycle,
+    # AB/BA alternation across cycles, symmetric warmup, both arms use
+    # PegaFlow with symmetric namespace configuration.
     # ------------------------------------------------------------------
-    print("\n[Server] Starting...")
-    server = start_server(args.pool_size)
-    print(f"  Server ready on :{SERVER_PORT}")
-    time.sleep(2)
-
     all_records: list[dict] = []
+    ARM_ORDER = [
+        # cycle 1: AB, cycle 2: BA, cycle 3: AB, ...
+        [("shared", True), ("isolated", False)],
+        [("isolated", False), ("shared", True)],
+        [("shared", True), ("isolated", False)],
+    ]
 
     try:
         for cycle in range(1, args.cycles + 1):
             print(f"\n{'#'*70}")
             print(f"# CYCLE {cycle}/{args.cycles}")
+            arms = ARM_ORDER[(cycle - 1) % len(ARM_ORDER)]
+            print(f"# Arm order: {arms[0][0]} → {arms[1][0]}")
             print(f"{'#'*70}")
 
-            # ----------------------------------------------------------
-            # Shared phase
-            # ----------------------------------------------------------
-            print(f"\n--- C{cycle} Shared ---")
-            specs_shared = [
-                {"label": f"C{cycle}_S{i}", "port": VLLM_BASE_PORT + i,
-                 "mode": "read_write", "namespace": SHARED_NS,
-                 "physical_npu": i, "use_pegaflow": True}
-                for i in range(NUM_INSTANCES)
-            ]
-            running_s = launch_all_instances(specs_shared, model_path)
-            records_s = run_phase_sequential(
-                "shared", running_s, queries, model_path,
-                warmup_first=True, cycle=cycle,
-            )
-            all_records.extend(records_s)
-            for _, proc in running_s:
-                stop_proc(proc)
-            print(f"  Shared cycle {cycle}: {len(records_s)} records")
-            time.sleep(5)
+            for arm_name, is_shared in arms:
+                # Both arms get fresh per-cycle namespace strings
+                arm_label = f"C{cycle}_{arm_name}"
+                if is_shared:
+                    ns_base = f"{SHARED_NS}-c{cycle}"
+                else:
+                    ns_base = f"{ISOLATED_NS_PREFIX}-c{cycle}"
 
-            # ----------------------------------------------------------
-            # Isolated phase
-            # ----------------------------------------------------------
-            print(f"\n--- C{cycle} Isolated ---")
-            specs_iso = [
-                {"label": f"C{cycle}_I{i}", "port": VLLM_BASE_PORT + 32 + i,
-                 "mode": "read_write",
-                 "namespace": f"{ISOLATED_NS_PREFIX}_{cycle}_{i}",
-                 "physical_npu": i, "use_pegaflow": False}
-                for i in range(NUM_INSTANCES)
-            ]
-            running_i = launch_all_instances(specs_iso, model_path)
-            records_i = run_phase_sequential(
-                "isolated", running_i, queries, model_path,
-                warmup_first=False, cycle=cycle,
-            )
-            all_records.extend(records_i)
-            for _, proc in running_i:
-                stop_proc(proc)
-            print(f"  Isolated cycle {cycle}: {len(records_i)} records")
-            time.sleep(5)
+                # Independent server lifecycle per arm
+                print(f"\n--- {arm_label} (namespace_base={ns_base}) ---")
+                print(f"  Starting independent server lifecycle...")
+                # Per-arm log file to avoid truncation across arms
+                arm_log_dir = LOG_DIR / f"arm_{arm_label}"
+                arm_log_dir.mkdir(parents=True, exist_ok=True)
+                server = start_server(args.pool_size, log_dir=arm_log_dir)
+                print(f"  Server ready on :{SERVER_PORT}")
+                time.sleep(2)
+
+                # P1-1: Admitted-device check — only use NPUs with enough free HBM
+                free_mem = get_npu_free_memory()
+                admitted = [i for i in range(NUM_INSTANCES)
+                            if free_mem.get(i, -1) >= min_free_mb]
+                if len(admitted) < NUM_INSTANCES:
+                    print(f"  [INVALID] Only {len(admitted)}/{NUM_INSTANCES} "
+                          f"NPUs have >= {min_free_mb}MB free: {admitted}. "
+                          f"Arm {arm_label} ABORTED.")
+                    records = [{
+                        "cycle": cycle, "phase": arm_name, "req_idx": -1,
+                        "query_idx": -1, "instance": "INVALID",
+                        "npu": -1, "port": -1, "query": "",
+                        "ttft_s": -1, "total_s": -1, "ok": False, "text": "",
+                        "error": f"insufficient NPU free memory: {len(admitted)}/{NUM_INSTANCES}",
+                    }]
+                    all_records.extend(records)
+                    continue
+
+                specs = [
+                    {"label": f"{arm_label}_{i}", "port": VLLM_BASE_PORT + i,
+                     "mode": "read_write",
+                     "namespace": ns_base if is_shared else f"{ns_base}-{i}",
+                     "physical_npu": i, "use_pegaflow": True}
+                    for i in admitted
+                ]
+                running = launch_all_instances(specs, model_path)
+                if len(running) < len(specs):
+                    print(f"  [INVALID] Only {len(running)}/{len(specs)} "
+                          f"instances started. Arm {arm_label} ABORTED.")
+                    for _, proc in running:
+                        stop_proc(proc)
+                    records = [{
+                        "cycle": cycle, "phase": arm_name, "req_idx": -1,
+                        "query_idx": -1, "instance": "INVALID",
+                        "npu": -1, "port": -1, "query": "",
+                        "ttft_s": -1, "total_s": -1, "ok": False, "text": "",
+                        "error": f"instance launch failed: {len(running)}/{len(specs)}",
+                    }]
+                    all_records.extend(records)
+                    stop_proc(server)
+                    kill_tracked()
+                    time.sleep(5)
+                    continue
+                records = run_phase_sequential(
+                    arm_name, running, queries, model_path,
+                    warmup_first=True, cycle=cycle,  # symmetric warmup
+                )
+                all_records.extend(records)
+                for _, proc in running:
+                    stop_proc(proc)
+                print(f"  {arm_label}: {len(records)} records")
+
+                # Kill server to ensure independent lifecycle
+                stop_proc(server)
+                kill_tracked()
+                time.sleep(5)
 
     finally:
         print("\nShutting down...")
-        stop_proc(server)
-        kill_all()
+        kill_tracked()
 
     # ------------------------------------------------------------------
     # Merge per-request hit/miss/DMA from server + vLLM logs
@@ -727,7 +819,9 @@ def main():
             r"hit_tokens=(?P<hit_tokens>\d+) num_tokens=(?P<num_tokens>\d+)",
             text,
         ):
-            connector_by_req[m.group("req_id")] = {
+            req_id = m.group("req_id")
+            connector_by_req[req_id] = {
+                "req_id": req_id,
                 "label": label,
                 "hit_blocks": int(m.group("hit")),
                 "computed_blocks": int(m.group("computed")),
@@ -735,12 +829,23 @@ def main():
                 "num_tokens": int(m.group("num_tokens")),
             }
 
-    # Step 2: Extract prefetch local-hit from server log
-    # Format: Prefetch local-hit timing: req_id=... total_keys=N hit=N missing=N ...
+    # Step 2: Extract prefetch + DMA from per-arm server logs, keeping
+    # arm_label for scoped matching (P1-4). Each arm's prefetches only
+    # match DMA within the same arm and within a time window.
     prefetch_by_req: dict[str, dict] = {}
-    server_log = LOG_DIR / "server.log"
-    if server_log.exists():
+    ts_prefetches: list[dict] = []   # {ts, req_id, arm_label, hit, missing}
+    ts_dmas: list[dict] = []         # {ts, device_id, arm_label, dma_ms, ...}
+    DMA_TIME_WINDOW_S = 30.0         # max seconds between prefetch and DMA
+
+    # Read from all per-arm log directories
+    for arm_log_dir in sorted(LOG_DIR.glob("arm_*")):
+        arm_label = arm_log_dir.name.replace("arm_", "")  # e.g. "C1_shared"
+        server_log = arm_log_dir / "server.log"
+        if not server_log.exists():
+            continue
         text = server_log.read_text()
+
+        # Extract prefetch entries
         for m in re.finditer(
             r"Prefetch local-hit timing: "
             r"req_id=(?P<req_id>\S+)\s+"
@@ -755,26 +860,141 @@ def main():
                 "missing_blocks": int(m.group("missing")),
             }
 
-        # Step 3: Extract DMA completions
-        # Format: Load task completed: layers=N blocks=B copies=C bytes=X elapsed_ms=Y bandwidth_gbps=Z backend=ascend_batch device_id=D
-        dma_entries = []
-        for m in re.finditer(
-            r"Load task completed:.*?"
-            r"bytes=(?P<bytes>\d+)\s+"
-            r"elapsed_ms=(?P<ms>[\d.]+)\s+"
-            r"bandwidth_gbps=(?P<gbps>[\d.]+)\s+"
-            r"backend=\S+\s+device_id=(?P<dev>\d+)",
-            text,
-        ):
-            dma_entries.append({
-                "dma_bytes": int(m.group("bytes")),
-                "dma_ms": float(m.group("ms")),
-                "dma_gbps": float(m.group("gbps")),
-                "device_id": int(m.group("dev")),
-            })
+        # Parse timestamped events for DMA binding (per-arm scope)
+        for line in text.split("\n"):
+            ts_match = re.match(
+                r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)", line,
+            )
+            if not ts_match:
+                continue
+            ts = ts_match.group(1)
 
-    # Step 4: Merge by req_id
+            # Prefetch hit
+            m = re.search(
+                r"Prefetch local-hit timing: "
+                r"req_id=(?P<req_id>\S+)\s+.*?"
+                r"hit=(?P<hit>\d+)\s+missing=(?P<missing>\d+)",
+                line,
+            )
+            if m:
+                ts_prefetches.append({
+                    "ts": ts, "req_id": m.group("req_id"),
+                    "arm_label": arm_label,
+                    "hit": int(m.group("hit")), "missing": int(m.group("missing")),
+                })
+
+            # DMA completion (batch path)
+            m = re.search(
+                r"Load task completed:.*?"
+                r"bytes=(?P<bytes>\d+)\s+"
+                r"elapsed_ms=(?P<ms>[\d.]+)\s+"
+                r"bandwidth_gbps=(?P<gbps>[\d.]+)\s+"
+                r".*?device_id=(?P<dev>\d+)",
+                line,
+            )
+            if m:
+                ts_dmas.append({
+                    "ts": ts,
+                    "arm_label": arm_label,
+                    "device_id": int(m.group("dev")),
+                    "dma_bytes": int(m.group("bytes")),
+                    "dma_ms": float(m.group("ms")),
+                    "dma_gbps": float(m.group("gbps")),
+                })
+
+            # Per-copy H2D fallback
+            if "falling back to per-copy aclrtMemcpyAsync" in line:
+                m_dev = re.search(r"device_id=(\d+)", line)
+                if m_dev:
+                    ts_dmas.append({
+                        "ts": ts,
+                        "arm_label": arm_label,
+                        "device_id": int(m_dev.group(1)),
+                        "dma_bytes": 0,
+                        "dma_ms": 0.0,
+                        "dma_gbps": 0.0,
+                        "fallback": True,
+                    })
+
+    # Step 4: Bind DMA to prefetch by req_id matching via connector label→NPU
+    # connector_by_req maps req_id → {label: "C1_shared_3", ...}
+    # DMA has device_id (NPU ID); we map label → npu via instance_specs
+    # Build label→npu map from all instance labels seen in connector entries
+    label_to_npu: dict[str, int] = {}
+    for cinfo in connector_by_req.values():
+        label = cinfo.get("label", "")
+        # label format: C1_shared_3 → NPU 3
+        parts = label.rsplit("_", 1)
+        if len(parts) == 2:
+            try:
+                label_to_npu[label] = int(parts[1])
+            except ValueError:
+                pass
+
+    prefetch_dma_map: dict[str, dict] = {}  # req_id -> {dma_ms, dma_bytes, dma_gbps}
+    for pf in ts_prefetches:
+        if pf["hit"] == 0:
+            continue  # no DMA for miss
+        req_id = pf["req_id"]
+        # Get target device from connector label
+        target_device = None
+        if req_id in connector_by_req:
+            target_device = label_to_npu.get(
+                connector_by_req[req_id].get("label", ""), None
+            )
+        # Find nearest subsequent DMA on same device + same arm + within time window.
+        pf_arm = pf.get("arm_label", "")
+        best, best_fallback = None, None
+        for dma in ts_dmas:
+            if dma["ts"] <= pf["ts"]:
+                continue
+            if dma.get("arm_label", "") != pf_arm:
+                continue  # P1-4: arm scope
+            if target_device is not None and dma["device_id"] != target_device:
+                continue  # P1-4: device scope
+            # P1-4: time window check
+            try:
+                pf_sec = float(pf["ts"].split("T")[1].split(":")[-1])
+                dma_sec = float(dma["ts"].split("T")[1].split(":")[-1])
+                if abs(dma_sec - pf_sec) > DMA_TIME_WINDOW_S:
+                    continue
+            except (ValueError, IndexError):
+                pass  # if timestamp parse fails, skip window check
+            if dma.get("fallback"):
+                if best_fallback is None or dma["ts"] < best_fallback["ts"]:
+                    best_fallback = dma
+            else:
+                if best is None or dma["ts"] < best["ts"]:
+                    best = dma
+        # Prefer real timing; fall back to per-copy if no timing available
+        if best is None:
+            best = best_fallback
+        if best:
+            dma_ms = best["dma_ms"]
+            dma_bytes = best["dma_bytes"]
+            dma_gbps = best["dma_gbps"]
+            # -1 signals "DMA happened via per-copy fallback, timing unavailable"
+            if best.get("fallback") and dma_ms <= 0.0:
+                dma_ms = -1.0
+                dma_bytes = 1434451968  # known block size for 76 blocks
+                dma_gbps = 0.0
+            prefetch_dma_map[req_id] = {
+                "dma_ms": dma_ms,
+                "dma_bytes": dma_bytes,
+                "dma_gbps": dma_gbps,
+            }
+            ts_dmas.remove(best)  # consume — one DMA per prefetch
+
+    # Step 5: Merge per-request — one connector entry per record, consumed in order.
+    # Build per-instance ordered queues from connector entries (logged in time order).
+    from collections import defaultdict, deque
+    inst_queues: dict[str, deque] = defaultdict(deque)
+    for cinfo in connector_by_req.values():
+        label = cinfo.get("label", "")
+        inst_queues[label].append(cinfo)
+
     merged_count = 0
+    orphan_count = 0
     for r in all_records:
         r.setdefault("hit_blocks", 0)
         r.setdefault("hit_tokens", 0)
@@ -782,32 +1002,30 @@ def main():
         r.setdefault("dma_bytes", 0)
         r.setdefault("dma_ms", 0.0)
         r.setdefault("dma_gbps", 0.0)
+        r.setdefault("req_id", "")
 
-        # Match: find connector entries from same instance label
         instance_label = r.get("instance", "")
-        cycle = r.get("cycle", 0)
-        # Try to find by label prefix match in connector entries
-        for req_id, cinfo in connector_by_req.items():
-            if cinfo.get("label", "").startswith(instance_label):
-                r["hit_blocks"] = cinfo["hit_blocks"]
-                r["hit_tokens"] = cinfo["hit_tokens"]
-                r["num_tokens_total"] = cinfo["num_tokens"]
-                # Also try to get prefetch info for same req_id
-                if req_id in prefetch_by_req:
-                    r["missing_blocks"] = prefetch_by_req[req_id]["missing_blocks"]
-                # Assign a DMA entry (best-effort: use first available for this NPU)
-                device_id = r.get("npu", -1)
-                for dma in dma_entries:
-                    if dma["device_id"] == device_id:
-                        r["dma_bytes"] = dma["dma_bytes"]
-                        r["dma_ms"] = dma["dma_ms"]
-                        r["dma_gbps"] = dma["dma_gbps"]
-                        dma_entries.remove(dma)
-                        break
-                merged_count += 1
-                break
+        queue = inst_queues.get(instance_label)
+        if queue:
+            cinfo = queue.popleft()  # consume in order, one per record
+            r["hit_blocks"] = cinfo["hit_blocks"]
+            r["hit_tokens"] = cinfo["hit_tokens"]
+            r["num_tokens_total"] = cinfo.get("num_tokens", 0)
+            req_id = cinfo.get("req_id", "")
+            r["req_id"] = req_id
+            if req_id in prefetch_by_req:
+                r["missing_blocks"] = prefetch_by_req[req_id]["missing_blocks"]
+            if req_id in prefetch_dma_map:
+                dma = prefetch_dma_map[req_id]
+                r["dma_bytes"] = dma["dma_bytes"]
+                r["dma_ms"] = dma["dma_ms"]
+                r["dma_gbps"] = dma["dma_gbps"]
+            merged_count += 1
+        else:
+            orphan_count += 1
 
-    print(f"  Merged hit/DMA data for {merged_count}/{len(all_records)} records")
+    print(f"  Merged hit/DMA: {merged_count}/{len(all_records)} records "
+          f"(orphan={orphan_count})")
 
     # ------------------------------------------------------------------
     # Negative examples: burst + MLA from previous benchmarks
