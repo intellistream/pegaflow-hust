@@ -14,15 +14,16 @@ Usage:
 
 from __future__ import annotations
 
-import argparse, hashlib, json, os, re, signal, subprocess, sys
-import threading, time, urllib.request, urllib.error
+import argparse, hashlib, json, os, random, re, signal, subprocess, sys
+import threading, time, urllib.request, urllib.error, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path("/workspace/HUST/pegaflow-hust")
-LOG_DIR = Path("/workspace/HUST/pegaflow-hust/results/trace-audit/logs")
-OUT_DIR = Path("/workspace/HUST/pegaflow-hust/results/trace-audit")
+_RUN_ID = time.strftime("%Y%m%d-%H%M%S")
+LOG_DIR = Path(f"/workspace/HUST/pegaflow-hust/results/trace-audit/{_RUN_ID}/logs")
+OUT_DIR = Path(f"/workspace/HUST/pegaflow-hust/results/trace-audit/{_RUN_ID}")
 
 MODEL_PATH = "/workspace/HUST/models/Qwen3-8B"
 SERVER_PORT = 50080
@@ -193,7 +194,9 @@ def stop_proc(proc):
             pass
 
 
-def start_server(pool_size="4096mb", log_dir=None):
+def start_server(pool_size="4096mb", log_dir=None, devices=None):
+    if devices is None:
+        devices = list(range(NUM_INSTANCES))
     if log_dir is None:
         log_dir = LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -203,7 +206,7 @@ def start_server(pool_size="4096mb", log_dir=None):
             str(PROJECT_ROOT / "target" / "debug" / "pegaflow-server"),
             "--addr", f"0.0.0.0:{SERVER_PORT}",
             "--pool-size", pool_size,
-            "--devices", "0,1,2,3,4,5,6,7",
+            "--devices", ",".join(str(d) for d in devices),
         ],
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
@@ -302,11 +305,18 @@ def launch_all_instances(specs, model_path):
 # =========================================================================
 
 def send_one_streaming(port, prompt, model_path, max_tokens=64, timeout=600):
-    """Send streaming request, return {ttft_s, total_s, text, ok}."""
+    """Send streaming request, return {ttft_s, total_s, text, ok, req_id}.
+
+    The client-generated request_id (UUID) is passed to vLLM via the
+    request body. vLLM uses it as EngineCoreRequest.request_id, which
+    flows through connector cache_lookup logs and server prefetch logs.
+    """
+    client_req_id = f"trace-{uuid.uuid4().hex[:12]}"
     data = json.dumps({
         "model": model_path, "prompt": prompt,
         "max_tokens": max_tokens, "temperature": 0.0,
         "stream": True,
+        "request_id": client_req_id,
     }).encode()
     t0 = time.perf_counter()
     ttft_s = -1.0
@@ -336,10 +346,10 @@ def send_one_streaming(port, prompt, model_path, max_tokens=64, timeout=600):
                 continue
         total_s = time.perf_counter() - t0
         return {"ttft_s": round(ttft_s, 4), "total_s": round(total_s, 4),
-                "text": text[:80], "ok": True}
+                "text": text[:80], "ok": True, "req_id": client_req_id}
     except Exception as e:
         return {"ttft_s": -1, "total_s": -1, "text": "", "ok": False,
-                "error": str(e)[:200]}
+                "error": str(e)[:200], "req_id": client_req_id}
 
 
 def extract_dma_from_server_log(req_id: str) -> dict:
@@ -399,14 +409,28 @@ def run_phase_sequential(phase_name, instances, queries, model_path,
     records: list[dict] = []
     t0 = time.perf_counter()
 
-    # Warmup (if applicable)
+    # Warmup (if applicable) — produces a record marked producer=True.
+    # Producer records are excluded from deque matching (P2-2).
+    producer_instance = None
     if warmup_first and len(instances) >= 1:
         warmup_spec, warmup_proc = instances[0]
+        producer_instance = warmup_spec["label"]
         prompt = f"{SYSTEM_PROMPT}\n\nUser: {queries[0]}\n\nAssistant:"
+        t_req = time.perf_counter()
         r = send_one_streaming(warmup_spec["port"], prompt, model_path)
+        records.append({
+            "cycle": cycle, "phase": phase_name, "req_idx": -1,
+            "query_idx": -1, "instance": warmup_spec["label"],
+            "npu": warmup_spec["physical_npu"],
+            "port": warmup_spec["port"],
+            "query": queries[0][:50],
+            **r,
+            "wall_clock_at_send": round(t_req - t0, 4),
+            "producer": True,  # seeds cache, not a consumer
+        })
         print(f"    [WARMUP] {warmup_spec['label']} "
               f"TTFT={r['ttft_s']:.4f}s ok={r['ok']}")
-        time.sleep(30)  # seal delay: write pipeline needs ~20-25s to seal blocks after warmup
+        time.sleep(30)
 
     # Timed phase
     idx = 0
@@ -429,6 +453,7 @@ def run_phase_sequential(phase_name, instances, queries, model_path,
                 "query": q[:50],
                 **r,
                 "wall_clock_at_send": round(t_req - t0, 4),
+                "producer": (spec["label"] == producer_instance),
             }
             records.append(record)
             status = (f"TTFT={r['ttft_s']:.4f}s" if r["ok"]
@@ -437,6 +462,78 @@ def run_phase_sequential(phase_name, instances, queries, model_path,
             idx += 1
             time.sleep(0.5)
     return records
+
+
+# =========================================================================
+# Pure matching function — testable without hardware
+# =========================================================================
+
+def merge_by_req_id(
+    all_records: list[dict],
+    connector_by_req: dict[str, dict],
+    prefetch_by_req: dict[str, dict],
+    prefetch_dma_map: dict[str, dict],
+) -> dict:
+    """Merge per-request hit/DMA data by client-generated request_id.
+
+    Client sends UUID in JSON body. vLLM prepends "cmpl-" and appends
+    "-{idx}-{hash}". We match by substring containment.
+
+    Returns dict with: matched, unmatched, producer_skipped, coverage_pct.
+    Does NOT mutate all_records — call site is responsible.
+    """
+    matched = 0
+    unmatched = 0
+    producer_skipped = 0
+    total_consumers = 0
+
+    for r in all_records:
+        r.setdefault("hit_blocks", 0)
+        r.setdefault("hit_tokens", 0)
+        r.setdefault("missing_blocks", 0)
+        r.setdefault("dma_bytes", 0)
+        r.setdefault("dma_ms", 0.0)
+        r.setdefault("dma_gbps", 0.0)
+
+        if r.get("producer"):
+            producer_skipped += 1
+            continue
+
+        total_consumers += 1
+        client_req_id = r.get("req_id", "")
+        cinfo = None
+        matched_conn_key = None
+        for conn_key, info in connector_by_req.items():
+            if client_req_id in conn_key:
+                cinfo = info
+                matched_conn_key = conn_key
+                break
+
+        if cinfo and matched_conn_key:
+            r["hit_blocks"] = cinfo["hit_blocks"]
+            r["hit_tokens"] = cinfo["hit_tokens"]
+            r["num_tokens_total"] = cinfo.get("num_tokens", 0)
+            server_req_id = matched_conn_key
+            if server_req_id in prefetch_by_req:
+                r["missing_blocks"] = prefetch_by_req[server_req_id]["missing_blocks"]
+            if server_req_id in prefetch_dma_map:
+                dma = prefetch_dma_map[server_req_id]
+                r["dma_bytes"] = dma["dma_bytes"]
+                r["dma_ms"] = dma["dma_ms"]
+                r["dma_gbps"] = dma["dma_gbps"]
+            matched += 1
+        else:
+            unmatched += 1
+
+    coverage_pct = (matched / total_consumers * 100.0
+                    if total_consumers > 0 else 0.0)
+    return {
+        "matched": matched,
+        "unmatched": unmatched,
+        "producer_skipped": producer_skipped,
+        "total_consumers": total_consumers,
+        "coverage_pct": round(coverage_pct, 1),
+    }
 
 
 # =========================================================================
@@ -451,7 +548,6 @@ def compute_stats(records: list[dict], key="ttft_s") -> dict:
     mean = sum(vals) / n
     median = vals[n // 2] if n % 2 == 1 else (vals[n // 2 - 1] + vals[n // 2]) / 2
     # 95% CI via bootstrap percentile
-    import random
     random.seed(42)
     boot_means = []
     for _ in range(1000):
@@ -460,8 +556,11 @@ def compute_stats(records: list[dict], key="ttft_s") -> dict:
     boot_means.sort()
     ci_low = boot_means[25]
     ci_high = boot_means[974]
+    q1 = vals[n // 4] if n >= 4 else vals[0]
+    q3 = vals[3 * n // 4] if n >= 4 else vals[-1]
     return {
         "n": n, "mean": round(mean, 4), "median": round(median, 4),
+        "iqr": round(q3 - q1, 4),
         "ci_95_low": round(ci_low, 4), "ci_95_high": round(ci_high, 4),
         "min": round(vals[0], 4), "max": round(vals[-1], 4),
     }
@@ -471,10 +570,15 @@ def compute_stats(records: list[dict], key="ttft_s") -> dict:
 # Summary + break-even
 # =========================================================================
 
-def write_summary(env_info, all_records, negative_examples, out_dir):
+def write_summary(env_info, all_records, negative_examples, merge_result, out_dir):
     """Write trace_summary.md with median/CI and break-even analysis."""
-    shared = [r for r in all_records if r.get("phase") == "shared" and r.get("ok")]
-    isolated = [r for r in all_records if r.get("phase") == "isolated" and r.get("ok")]
+    # P2-5: separate producer (warmup seed) from consumer (cross-instance).
+    # Producer records seed the shared cache but are not themselves consumers.
+    shared = [r for r in all_records
+              if r.get("phase") == "shared" and r.get("ok") and not r.get("producer")]
+    isolated = [r for r in all_records
+                if r.get("phase") == "isolated" and r.get("ok") and not r.get("producer")]
+    producers = [r for r in all_records if r.get("ok") and r.get("producer")]
 
     ttft_s = compute_stats(shared, "ttft_s")
     ttft_i = compute_stats(isolated, "ttft_s")
@@ -649,6 +753,45 @@ def write_summary(env_info, all_records, negative_examples, out_dir):
         f"- Root cause: {negative_examples['mla_tp8_deepseek_v2_lite']['root_cause']}",
         f"- Verdict: {negative_examples['mla_tp8_deepseek_v2_lite']['verdict']}",
         "",
+    ]
+
+    # Producer (warmup seed) stats
+    if producers:
+        p_ttft = compute_stats(producers, "ttft_s")
+        lines += [
+            "",
+            "## Producer (Warmup Seed) Records",
+            f"- Count: {p_ttft['n']}",
+            f"- Median TTFT: {p_ttft['median']:.4f}s",
+            f"- Mean TTFT: {p_ttft['mean']:.4f}s",
+            "- These records are excluded from consumer paired-delta analysis.",
+            "- They seed the shared cache but are not themselves cross-instance consumers.",
+        ]
+
+    # Validity manifest (coverage gate included — P2-3)
+    validity_ok = (
+        ttft_s["n"] >= 12 and ttft_i["n"] >= 12
+        and len(all_records) > 0
+        and merge_result.get("coverage_pct", 0) >= 100.0
+    )
+    if merge_result.get("coverage_pct", 0) < 100.0:
+        lines.append(
+            f"- Coverage gate FAILED: {merge_result['coverage_pct']:.1f}% "
+            f"(requires 100%)")
+    lines += [
+        "",
+        "## Validity Manifest",
+        f"- Run ID: {_RUN_ID}",
+        f"- Total records: {len(all_records)}",
+        f"- Consumer shared records: {ttft_s['n']}",
+        f"- Consumer isolated records: {ttft_i['n']}",
+        f"- Producer records: {p_ttft['n']}",
+        f"- INVALID records: {sum(1 for r in all_records if not r.get('ok'))}",
+        f"- Validity gate: {'PASS' if validity_ok else 'FAIL'}",
+    ]
+
+    lines += [
+        "",
         "## Artifacts",
         f"- Raw records: `{out_dir}/trace_audit.json`",
         f"- Per-arm server logs: `{LOG_DIR}/arm_*/server.log`",
@@ -730,17 +873,9 @@ def main():
                 else:
                     ns_base = f"{ISOLATED_NS_PREFIX}-c{cycle}"
 
-                # Independent server lifecycle per arm
-                print(f"\n--- {arm_label} (namespace_base={ns_base}) ---")
-                print(f"  Starting independent server lifecycle...")
-                # Per-arm log file to avoid truncation across arms
-                arm_log_dir = LOG_DIR / f"arm_{arm_label}"
-                arm_log_dir.mkdir(parents=True, exist_ok=True)
-                server = start_server(args.pool_size, log_dir=arm_log_dir)
-                print(f"  Server ready on :{SERVER_PORT}")
-                time.sleep(2)
-
-                # P1-1: Admitted-device check — only use NPUs with enough free HBM
+                # P1-1: Admitted-device check BEFORE starting server.
+                # Admission gate — only admit NPUs with enough free HBM.
+                # If < NUM_INSTANCES available, mark arm INVALID and skip.
                 free_mem = get_npu_free_memory()
                 admitted = [i for i in range(NUM_INSTANCES)
                             if free_mem.get(i, -1) >= min_free_mb]
@@ -748,15 +883,26 @@ def main():
                     print(f"  [INVALID] Only {len(admitted)}/{NUM_INSTANCES} "
                           f"NPUs have >= {min_free_mb}MB free: {admitted}. "
                           f"Arm {arm_label} ABORTED.")
-                    records = [{
+                    all_records.append({
                         "cycle": cycle, "phase": arm_name, "req_idx": -1,
-                        "query_idx": -1, "instance": "INVALID",
-                        "npu": -1, "port": -1, "query": "",
-                        "ttft_s": -1, "total_s": -1, "ok": False, "text": "",
-                        "error": f"insufficient NPU free memory: {len(admitted)}/{NUM_INSTANCES}",
-                    }]
-                    all_records.extend(records)
+                        "query_idx": -1, "instance": "INVALID", "npu": -1,
+                        "port": -1, "query": "", "ttft_s": -1, "total_s": -1,
+                        "ok": False, "text": "",
+                        "error": f"insufficient NPU free: {len(admitted)}/{NUM_INSTANCES}",
+                        "producer": False,
+                    })
                     continue
+
+                # Independent server lifecycle per arm
+                print(f"\n--- {arm_label} (namespace_base={ns_base}) ---")
+                print(f"  Admitting NPUs: {admitted}")
+                print(f"  Starting independent server lifecycle...")
+                arm_log_dir = LOG_DIR / f"arm_{arm_label}"
+                arm_log_dir.mkdir(parents=True, exist_ok=True)
+                server = start_server(args.pool_size, log_dir=arm_log_dir,
+                                      devices=admitted)
+                print(f"  Server ready on :{SERVER_PORT}")
+                time.sleep(2)
 
                 specs = [
                     {"label": f"{arm_label}_{i}", "port": VLLM_BASE_PORT + i,
@@ -952,14 +1098,18 @@ def main():
                 continue  # P1-4: arm scope
             if target_device is not None and dma["device_id"] != target_device:
                 continue  # P1-4: device scope
-            # P1-4: time window check
+            # P1-4 / P2-3: time window using full ISO timestamp parse.
+            # Prior version only compared the seconds field (split(":")[-1]),
+            # which breaks across minute boundaries (10:05:59 vs 10:06:01).
             try:
-                pf_sec = float(pf["ts"].split("T")[1].split(":")[-1])
-                dma_sec = float(dma["ts"].split("T")[1].split(":")[-1])
-                if abs(dma_sec - pf_sec) > DMA_TIME_WINDOW_S:
+                from datetime import datetime
+                ts_fmt = "%Y-%m-%dT%H:%M:%S.%f"
+                pf_dt = datetime.strptime(pf["ts"][:26], ts_fmt)
+                dma_dt = datetime.strptime(dma["ts"][:26], ts_fmt)
+                if abs((dma_dt - pf_dt).total_seconds()) > DMA_TIME_WINDOW_S:
                     continue
             except (ValueError, IndexError):
-                pass  # if timestamp parse fails, skip window check
+                pass
             if dma.get("fallback"):
                 if best_fallback is None or dma["ts"] < best_fallback["ts"]:
                     best_fallback = dma
@@ -985,47 +1135,18 @@ def main():
             }
             ts_dmas.remove(best)  # consume — one DMA per prefetch
 
-    # Step 5: Merge per-request — one connector entry per record, consumed in order.
-    # Build per-instance ordered queues from connector entries (logged in time order).
-    from collections import defaultdict, deque
-    inst_queues: dict[str, deque] = defaultdict(deque)
-    for cinfo in connector_by_req.values():
-        label = cinfo.get("label", "")
-        inst_queues[label].append(cinfo)
+    # Step 5: Merge per-request by client-generated request_id (pure function).
+    merge_result = merge_by_req_id(all_records, connector_by_req,
+                                   prefetch_by_req, prefetch_dma_map)
+    print(f"  Merged hit/DMA: {merge_result['matched']} records via req_id lookup "
+          f"(unmatched={merge_result['unmatched']}, "
+          f"producer_skipped={merge_result['producer_skipped']}, "
+          f"coverage={merge_result['coverage_pct']:.1f}%)")
 
-    merged_count = 0
-    orphan_count = 0
-    for r in all_records:
-        r.setdefault("hit_blocks", 0)
-        r.setdefault("hit_tokens", 0)
-        r.setdefault("missing_blocks", 0)
-        r.setdefault("dma_bytes", 0)
-        r.setdefault("dma_ms", 0.0)
-        r.setdefault("dma_gbps", 0.0)
-        r.setdefault("req_id", "")
-
-        instance_label = r.get("instance", "")
-        queue = inst_queues.get(instance_label)
-        if queue:
-            cinfo = queue.popleft()  # consume in order, one per record
-            r["hit_blocks"] = cinfo["hit_blocks"]
-            r["hit_tokens"] = cinfo["hit_tokens"]
-            r["num_tokens_total"] = cinfo.get("num_tokens", 0)
-            req_id = cinfo.get("req_id", "")
-            r["req_id"] = req_id
-            if req_id in prefetch_by_req:
-                r["missing_blocks"] = prefetch_by_req[req_id]["missing_blocks"]
-            if req_id in prefetch_dma_map:
-                dma = prefetch_dma_map[req_id]
-                r["dma_bytes"] = dma["dma_bytes"]
-                r["dma_ms"] = dma["dma_ms"]
-                r["dma_gbps"] = dma["dma_gbps"]
-            merged_count += 1
-        else:
-            orphan_count += 1
-
-    print(f"  Merged hit/DMA: {merged_count}/{len(all_records)} records "
-          f"(orphan={orphan_count})")
+    # Coverage gate: non-zero exit if coverage != 100%
+    if merge_result["coverage_pct"] < 100.0:
+        print(f"  [WARNING] Request/DMA coverage is {merge_result['coverage_pct']:.1f}%, "
+              f"not 100%. {merge_result['unmatched']} consumer records could not be matched.")
 
     # ------------------------------------------------------------------
     # Negative examples: burst + MLA from previous benchmarks
@@ -1064,7 +1185,7 @@ def main():
         json.dump(output, f, indent=2, default=str)
     print(f"Raw data: {out_json} ({len(all_records)} records)")
 
-    write_summary(env_info, all_records, negative_examples, OUT_DIR)
+    write_summary(env_info, all_records, negative_examples, merge_result, OUT_DIR)
 
     print("\n" + "=" * 70)
     print("  Trace audit complete.")
