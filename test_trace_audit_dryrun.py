@@ -221,7 +221,7 @@ def test_gate4_dma_arm_scoping():
          "device_id": 3, "dma_bytes": 200_000_000, "dma_ms": 12.0, "dma_gbps": 16.0},
     ]
 
-    dma_map, fallback, leftover, _violations = audit.bind_dma_to_prefetch(
+    dma_map, fallback, leftover, violations = audit.bind_dma_to_prefetch(
         ts_prefetches, ts_dmas, connector_by_req, label_to_npu)
     assert violations == [], f"Gate 4b: no bind violations expected: {violations}"
     # req-A binds its arm+device DMA (85ms), never the C1_isolated one
@@ -417,7 +417,7 @@ def test_gate4_bind_fallback_not_evidence():
          "device_id": 3, "dma_bytes": 0, "dma_ms": 0.0, "dma_gbps": 0.0,
          "fallback": True},
     ]
-    dma_map, fallback, leftover, _violations = audit.bind_dma_to_prefetch(
+    dma_map, fallback, leftover, violations = audit.bind_dma_to_prefetch(
         ts_prefetches, ts_dmas, connector_by_req, label_to_npu)
     assert dma_map == {}, "R6: fallback-only must NOT bind as DMA evidence"
     assert fallback == 1, f"R6: fallback_only_count should be 1, got {fallback}"
@@ -581,7 +581,7 @@ def test_gate6_fail_close_exit_code():
     proc = subprocess.run(
         [sys.executable, "-c",
          "import run_trace_audit as a; a.fail_close(['synthetic gate failure'])"],
-        cwd=here, capture_output=True, text=True, timeout=30)
+        cwd=here, capture_output=True, text=True, timeout=30, check=False)
     assert proc.returncode == 1, \
         f"Gate 6: fail_close must exit 1, got {proc.returncode}"
     assert "[INVALID]" in proc.stdout, \
@@ -759,7 +759,7 @@ def main():
         except AssertionError as e:
             print(f"  FAIL: {name} — {e}")
             all_passed = False
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  ERROR: {name} — {type(e).__name__}: {e}")
             all_passed = False
     print()
