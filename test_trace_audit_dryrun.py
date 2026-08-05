@@ -18,10 +18,13 @@ Validates the P1/P2 gates before any real hardware run:
   Gate 6:  fail-close exits non-zero (never 0 on INVALID evidence)
 """
 
-import json, os, re, subprocess, sys, tempfile, threading, time
+import os
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
-from collections import deque
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 # Append project root so we can import run_trace_audit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -32,7 +35,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 def test_gate1_device_admission():
     """Only NPUs with free HBM >= min_free_mb are admitted."""
-    import run_trace_audit as audit
 
     # Mock: NPU 0,1 have 30GB free; NPU 2,3 have 10GB free; rest have 25GB
     mock_free = {0: 30000, 1: 30000, 2: 10000, 3: 10000, 4: 25000, 5: 25000, 6: 25000, 7: 25000}
@@ -55,7 +57,6 @@ def test_gate1_device_admission():
 
 def test_gate2_fail_close():
     """If any instance fails to start, arm is INVALID."""
-    import run_trace_audit as audit
 
     # Simulate: 8 instances launched, but only 7 succeed
     specs = [{"label": f"I{i}", "port": 19000 + i, "mode": "read_write",
@@ -220,7 +221,7 @@ def test_gate4_dma_arm_scoping():
          "device_id": 3, "dma_bytes": 200_000_000, "dma_ms": 12.0, "dma_gbps": 16.0},
     ]
 
-    dma_map, fallback, leftover, violations = audit.bind_dma_to_prefetch(
+    dma_map, fallback, leftover, _violations = audit.bind_dma_to_prefetch(
         ts_prefetches, ts_dmas, connector_by_req, label_to_npu)
     assert violations == [], f"Gate 4b: no bind violations expected: {violations}"
     # req-A binds its arm+device DMA (85ms), never the C1_isolated one
@@ -416,7 +417,7 @@ def test_gate4_bind_fallback_not_evidence():
          "device_id": 3, "dma_bytes": 0, "dma_ms": 0.0, "dma_gbps": 0.0,
          "fallback": True},
     ]
-    dma_map, fallback, leftover, violations = audit.bind_dma_to_prefetch(
+    dma_map, fallback, leftover, _violations = audit.bind_dma_to_prefetch(
         ts_prefetches, ts_dmas, connector_by_req, label_to_npu)
     assert dma_map == {}, "R6: fallback-only must NOT bind as DMA evidence"
     assert fallback == 1, f"R6: fallback_only_count should be 1, got {fallback}"
@@ -467,7 +468,7 @@ def test_gate4_bind_negative():
         {"ts": "2026-08-01T10:00:01.100", "arm_label": "C1_shared",
          "device_id": 3, "dma_bytes": 1, "dma_ms": 2.0, "dma_gbps": 1.0},
     ]
-    dma_map, fallback, leftover, violations = audit.bind_dma_to_prefetch(
+    dma_map, fallback, leftover, _violations = audit.bind_dma_to_prefetch(
         ts_prefetches, ts_dmas, connector_by_req, label_to_npu)
     assert dma_map["cmpl-req-w"]["dma_ms"] == 2.0, "nearest valid DMA must bind"
     assert leftover == 2, f"late + wrong-device = 2 leftovers, got {leftover}"
@@ -575,7 +576,6 @@ def test_gate5b_monitor_polls():
 
 def test_gate6_fail_close_exit_code():
     """fail_close() must terminate the process with exit code 1, never 0."""
-    import run_trace_audit as audit
 
     here = str(Path(__file__).resolve().parent)
     proc = subprocess.run(

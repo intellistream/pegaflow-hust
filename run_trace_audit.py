@@ -1399,13 +1399,13 @@ def main():
 
     # ------------------------------------------------------------------
     # Matched-lifecycle runner: each arm gets independent server lifecycle,
-    # AB/BA alternation across cycles, symmetric warmup, both arms use
+    # AB/reverse-AB alternation across cycles, symmetric warmup, both arms use
     # PegaFlow with symmetric namespace configuration.
     # ------------------------------------------------------------------
     all_records: list[dict] = []
     drift_violations: list[str] = []  # P2-6: mid-arm admission drift
     ARM_ORDER = [
-        # cycle 1: AB, cycle 2: BA, cycle 3: AB, ...
+        # cycle 1: AB, cycle 2: reverse-AB, cycle 3: AB, ...
         [("shared", True), ("isolated", False)],
         [("isolated", False), ("shared", True)],
         [("shared", True), ("isolated", False)],
