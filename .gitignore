@@ -35,8 +35,3 @@ e2e_*.py
 # Environment-specific docs (not for upstream)
 docs/hardware-environment.md
 docs/p2-3-benchmarks.md
-
-# Trace audit results (generated at runtime, not committed)
-results/trace-audit/logs/
-results/trace-audit/trace_audit.json
-results/trace-audit/trace_summary.md

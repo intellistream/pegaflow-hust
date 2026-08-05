@@ -11,7 +11,7 @@
 //! error codes into `String` errors.
 
 use std::ffi::c_void;
-use std::sync::Once;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // CANN FFI bindings (extern "C")
@@ -140,22 +140,28 @@ unsafe extern "C" {
 // ACL Runtime Initialization (lazy, thread-safe)
 // ---------------------------------------------------------------------------
 
-static ACL_INIT: Once = Once::new();
+static ACL_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn memoized_init(
+    cell: &OnceLock<Result<(), String>>,
+    init: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    cell.get_or_init(init).clone()
+}
 
 /// Ensure the Ascend CL runtime is initialized (idempotent, thread-safe).
 ///
 /// Called automatically before any ACL API use; safe to call explicitly
 /// at process startup for eager initialization.
 pub fn ensure_acl_initialized() -> Result<(), String> {
-    let mut result = Ok(());
-    ACL_INIT.call_once(|| {
+    memoized_init(&ACL_INIT, || {
         let config_path = std::ptr::null::<i8>();
         let ret = unsafe { aclInit(config_path) };
         if ret != ACL_ERROR_NONE {
-            result = Err(format!("aclInit failed: error code {ret}"));
+            return Err(format!("aclInit failed: error code {ret}"));
         }
-    });
-    result
+        Ok(())
+    })
 }
 
 /// Deprecated alias kept for backward compatibility.
@@ -806,7 +812,44 @@ pub fn memcpy_d2h_sync(dst_host: *mut u8, src_device: u64, size: usize) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[test]
+    fn acl_init_failure_is_memoized() {
+        let cell = OnceLock::new();
+        let attempts = AtomicUsize::new(0);
+
+        let first = memoized_init(&cell, || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err("initialization failed".to_owned())
+        });
+        let second = memoized_init(&cell, || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+
+        assert_eq!(first, Err("initialization failed".to_owned()));
+        assert_eq!(second, Err("initialization failed".to_owned()));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn acl_init_success_runs_once() {
+        let cell = OnceLock::new();
+        let attempts = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            memoized_init(&cell, || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
 
     /// Smoke test: AscendDevice can be constructed without linking.
     /// Actual CANN calls require an Ascend environment; this test
