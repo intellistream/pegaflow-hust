@@ -99,12 +99,32 @@ Server is NOT reused across arms or cycles.
 | `dma_bytes` | server log | DMA transfer bytes |
 | `dma_ms` | server log | DMA transfer milliseconds |
 | `dma_gbps` | server log | DMA effective bandwidth |
+| `prefill_time_ms` | vLLM log (`Finished request … prompt_processing_ms=`) | Per-request prefill time (ms); `-1` if not logged |
+| `queue_time_ms` | vLLM log (`Finished request … queue_time=`) | Per-request queue time (ms); `-1` if not logged |
 
 ### 3.2 DMA Binding Method
 
 Server log parsed line-by-line with timestamps.
 Each prefetch `req_id` matched to nearest subsequent DMA completion on same device.
 DMA entry consumed (one DMA per prefetch hit).
+
+Registered binding scope (implemented in `bind_dma_to_prefetch`, stricter
+than the bare "same device" rule above — conservative direction, fewer
+mismatches):
+
+- **Arm scope**: a prefetch only binds DMA within its own arm lifecycle.
+- **Time window**: the DMA must fall within 30 s of its prefetch (full ISO
+  timestamp parse; safe across minute boundaries).
+- **1:1 consumption**: each bound DMA is consumed; duplicate completions for
+  one prefetch are counted (`occurrences`) and break conservation.
+- **Fallback is not evidence**: a per-copy fallback line
+  (`falling back to per-copy aclrtMemcpyAsync`) does NOT count as formal
+  batch-DMA evidence — a hit with only a fallback is INVALID, never a
+  silent `dma_ms=0` (R6).
+
+All binding/merge constraints are fail-close: any missing, duplicate,
+orphan, or leftover formal event (connector/prefetch/DMA) makes the run
+INVALID and the process exits non-zero (see §6).
 
 ---
 
@@ -151,8 +171,10 @@ For each query class q:
 ## 5. Artifact Binding
 
 Each run records:
-- `git rev-parse HEAD`
-- `git rev-parse --abbrev-ref HEAD`
+- `git rev-parse HEAD` (audit runner)
+- `git rev-parse HEAD^` (parent commit)
+- `git rev-parse --abbrev-ref HEAD` (branch)
+- Runtime vLLM checkout commit (`runtime_commit_vllm`, vllm-hust HEAD)
 - Model `config.json` MD5
 - `npu-smi info` output
 - `PYTHONHASHSEED`, `ASCEND_RT_VISIBLE_DEVICES`, `PEGAFLOW_*` env vars
@@ -177,9 +199,15 @@ negative examples with explicit root-cause annotation.
 |---|---|
 | Preregistration (this doc) | `docs/trace_preregistration.md` |
 | Trace runner (host-only) | `run_trace_audit.py` |
+| Host-only dry-run gates | `test_trace_audit_dryrun.py` |
 | Prior invalid trace (negative example) | `results/trace-audit-INVALID/` |
-| Validated trace (TBD after run) | `results/trace-audit/trace_audit.json` |
-| Summary (TBD after run) | `results/trace-audit/trace_summary.md` |
+| Validated trace (TBD after run) | `results/trace-audit/{run_id}/trace_audit.json` |
+| Summary (TBD after run) | `results/trace-audit/{run_id}/trace_summary.md` |
+
+Outputs are stored under a per-run id subdirectory
+(`results/trace-audit/{YYYYmmdd-HHMMSS}/`) so multiple runs never collide;
+the most recent run is the authoritative artifact of record. Logs per arm:
+`results/trace-audit/{run_id}/logs/arm_*/server.log` and `vllm_*.log`.
 
 ---
 

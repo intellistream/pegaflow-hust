@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse, hashlib, json, os, random, re, signal, subprocess, sys
 import threading, time, urllib.request, urllib.error, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -26,6 +27,7 @@ LOG_DIR = Path(f"/workspace/HUST/pegaflow-hust/results/trace-audit/{_RUN_ID}/log
 OUT_DIR = Path(f"/workspace/HUST/pegaflow-hust/results/trace-audit/{_RUN_ID}")
 
 MODEL_PATH = "/workspace/HUST/models/Qwen3-8B"
+VLLM_HUST_ROOT = Path("/workspace/HUST/vllm-hust")  # runtime vLLM checkout (A5)
 SERVER_PORT = 50080
 VLLM_BASE_PORT = 19000
 SHARED_NS = "audit-shared"
@@ -33,6 +35,8 @@ ISOLATED_NS_PREFIX = "audit-iso"
 NUM_INSTANCES = 8
 HBM_TOTAL_MB = 65536
 MIN_FREE_HBM_MB = 28 * 1024
+DMA_TIME_WINDOW_S = 30.0           # max seconds between prefetch and DMA
+ADMISSION_POLL_INTERVAL_S = 10.0   # mid-arm admission drift poll cadence
 
 _SYS_BLOCK = (
     "You are an expert AI assistant with deep knowledge across many domains "
@@ -80,18 +84,26 @@ def capture_environment() -> dict:
     """Record everything needed to reproduce this run."""
     info: dict = {}
 
-    # Git
+    # Git — HEAD, parent, and runtime vLLM checkout (A5: audit artifact must
+    # bind more than a single HEAD so the exact analyzed code is recoverable).
+    for _cmd, _key in [
+        (["rev-parse", "HEAD"], "git_commit"),
+        (["rev-parse", "HEAD^"], "git_parent"),
+        (["rev-parse", "--abbrev-ref", "HEAD"], "git_branch"),
+    ]:
+        try:
+            info[_key] = subprocess.check_output(
+                ["git", "-C", str(PROJECT_ROOT)] + _cmd, timeout=10,
+            ).decode().strip()
+        except Exception:
+            info[_key] = "unknown"
     try:
-        info["git_commit"] = subprocess.check_output(
-            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
-            timeout=10,
-        ).decode().strip()
-        info["git_branch"] = subprocess.check_output(
-            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+        info["runtime_commit_vllm"] = subprocess.check_output(
+            ["git", "-C", str(VLLM_HUST_ROOT), "rev-parse", "HEAD"],
             timeout=10,
         ).decode().strip()
     except Exception:
-        info["git_commit"] = "unknown"
+        info["runtime_commit_vllm"] = "unknown"
 
     # Model
     cfg_path = Path(MODEL_PATH) / "config.json"
@@ -152,6 +164,93 @@ def get_npu_free_memory() -> dict[int, int]:
                 free[current_npu] = total - used
                 current_npu = None
     return free
+
+
+def get_npu_processes() -> dict[int, list[int]]:
+    """Parse npu-smi process table: NPU id -> attached pids."""
+    procs: dict[int, list[int]] = {}
+    try:
+        out = subprocess.check_output(
+            ["npu-smi", "info"], stderr=subprocess.STDOUT, timeout=30,
+        ).decode()
+    except Exception:
+        return procs
+    in_proc_table = False
+    for line in out.split("\n"):
+        if "Process id" in line and "Process name" in line:
+            in_proc_table = True
+            continue
+        if not in_proc_table:
+            continue
+        m = re.match(r"\|\s*(\d+)\s+\d+\s+\|\s+(\d+)\s+(\S+)\s+\d+\s+\|", line)
+        if m:
+            procs.setdefault(int(m.group(1)), []).append(int(m.group(2)))
+    return procs
+
+
+def tracked_pgids() -> set[int]:
+    """Process-group ids of everything this runner spawned."""
+    pgids: set[int] = set()
+    for pid in list(_tracked_pids):
+        try:
+            pgids.add(os.getpgid(pid))
+        except (ProcessLookupError, PermissionError):
+            pgids.add(pid)
+    return pgids
+
+
+def expected_used_mb(npu: int, free_mb: dict[int, int]) -> int:
+    """Mirror of the gmu sizing used at launch — expected HBM footprint."""
+    fm = free_mb.get(npu, -1)
+    gmu = (max(0.15, min(0.85, (fm - 4096) / HBM_TOTAL_MB))
+           if fm > 4096 else 0.15)
+    return round(gmu * HBM_TOTAL_MB)
+
+
+def check_admission_drift(
+    admitted: list[int],
+    free_mb_pre: dict[int, int],
+    free_mb_now: dict[int, int],
+    expected_used_mb_by_npu: dict[int, int],
+    npu_procs: dict[int, list[int]],
+    tracked_pgids_set: set[int],
+    pgid_of=os.getpgid,
+    slack_mb: int = 8 * 1024,
+    min_free_mb: int = MIN_FREE_HBM_MB,
+) -> list[str]:
+    """Re-verify admission during arm execution (P2-6): owner PID + HBM.
+
+    free_mb_pre / free_mb_now: free HBM sampled at admission vs mid-arm.
+    expected_used_mb_by_npu: MB our own instances were expected to consume.
+    npu_procs: NPU id -> pids attached mid-arm (from get_npu_processes).
+    tracked_pgids_set: process groups we spawned (ours).
+
+    Returns violation strings; empty list == no drift, admission holds.
+    """
+    violations: list[str] = []
+    for npu in admitted:
+        pre = free_mb_pre.get(npu, -1)
+        now = free_mb_now.get(npu, -1)
+        exp = expected_used_mb_by_npu.get(npu, 0)
+        floor = min(min_free_mb, pre - exp - slack_mb) if pre >= 0 else min_free_mb
+        if now < floor:
+            violations.append(
+                f"NPU{npu} HBM drift: free={now}MB < floor={floor}MB "
+                f"(pre={pre}MB, expected_use={exp}MB, slack={slack_mb}MB)")
+        attached = npu_procs.get(npu, [])
+        if not attached:
+            violations.append(
+                f"NPU{npu} owner drift: no process attached (expected our instance)")
+            continue
+        for pid in attached:
+            try:
+                owned = pid in tracked_pgids_set or pgid_of(pid) in tracked_pgids_set
+            except (ProcessLookupError, PermissionError):
+                owned = False  # cannot verify -> fail-close
+            if not owned:
+                violations.append(
+                    f"NPU{npu} owner drift: foreign pid={pid} attached to admitted device")
+    return violations
 
 
 # =========================================================================
@@ -375,6 +474,28 @@ def extract_dma_from_server_log(req_id: str) -> dict:
     return dma_info
 
 
+def extract_vllm_timing(log_text: str) -> dict[str, dict]:
+    """Parse per-request prefill/queue timing from a vLLM log (A2).
+
+    Matches vLLM "Finished request <req_id>: <key=value ...>" lines and
+    keeps prompt_processing_ms -> prefill_time_ms and queue_time ->
+    queue_time_ms (both ms). Unknown keys are ignored; requests without a
+    matching line are simply absent (merge fills -1 defaults — these fields
+    are informational per-request timing, not fail-close evidence).
+    """
+    timing: dict[str, dict] = {}
+    for m in re.finditer(r"Finished request (?P<req>\S+):\s*(?P<kv>.*)",
+                         log_text):
+        entry = timing.setdefault(m.group("req"), {})
+        for kv in re.finditer(r"(\w+)=([\d.+-]+)", m.group("kv")):
+            key, val = kv.group(1), float(kv.group(2))
+            if key == "prompt_processing_ms":
+                entry["prefill_time_ms"] = val
+            elif key == "queue_time":
+                entry["queue_time_ms"] = val
+    return timing
+
+
 def extract_connector_log(vllm_log_path: Path, label: str) -> list[dict]:
     """Parse vLLM log for PegaKVConnector cache_lookup lines."""
     if not vllm_log_path.exists():
@@ -410,11 +531,12 @@ def run_phase_sequential(phase_name, instances, queries, model_path,
     t0 = time.perf_counter()
 
     # Warmup (if applicable) — produces a record marked producer=True.
-    # Producer records are excluded from deque matching (P2-2).
-    producer_instance = None
+    # Producer = the single warmup REQUEST only (prereg §2.3 step 4: timed
+    # phase is 3 queries x 8 instances = 24 consumers per arm). Marking the
+    # whole warmup instance as producer would silently drop its Q1/Q2 (which
+    # are ordinary consumers) and shrink analyzed N to 21.
     if warmup_first and len(instances) >= 1:
         warmup_spec, warmup_proc = instances[0]
-        producer_instance = warmup_spec["label"]
         prompt = f"{SYSTEM_PROMPT}\n\nUser: {queries[0]}\n\nAssistant:"
         t_req = time.perf_counter()
         r = send_one_streaming(warmup_spec["port"], prompt, model_path)
@@ -453,7 +575,9 @@ def run_phase_sequential(phase_name, instances, queries, model_path,
                 "query": q[:50],
                 **r,
                 "wall_clock_at_send": round(t_req - t0, 4),
-                "producer": (spec["label"] == producer_instance),
+                # Timed-phase requests are consumers — producer flag is
+                # reserved for the warmup seed request itself (prereg §2.3).
+                "producer": False,
             }
             records.append(record)
             status = (f"TTFT={r['ttft_s']:.4f}s" if r["ok"]
@@ -473,19 +597,61 @@ def merge_by_req_id(
     connector_by_req: dict[str, dict],
     prefetch_by_req: dict[str, dict],
     prefetch_dma_map: dict[str, dict],
+    dma_leftover_count: int = 0,
+    dma_fallback_only_count: int = 0,
+    timing_by_req: dict | None = None,
 ) -> dict:
     """Merge per-request hit/DMA data by client-generated request_id.
 
     Client sends UUID in JSON body. vLLM prepends "cmpl-" and appends
     "-{idx}-{hash}". We match by substring containment.
 
-    Returns dict with: matched, unmatched, producer_skipped, coverage_pct.
-    Does NOT mutate all_records — call site is responsible.
+    Fail-close conservation (P2-6): connector / prefetch / DMA events are
+    formal evidence. Every consumer request must have exactly one connector
+    event and one prefetch event; a request with hit_blocks > 0 additionally
+    requires exactly one DMA event. Duplicate events for one request, orphan
+    events matching no request, and leftover DMA completions all break
+    conservation and invalidate the run (never "first match wins").
+
+    Records are flagged with _audit_invalid / _audit_reason when their
+    evidence chain is broken; producer (warmup seed) events are claimed so
+    they do not count as orphans.
+
+    Returns dict with matched/unmatched/coverage plus per-type uniqueness
+    and conservation accounting; every violation is listed in `violations`.
     """
     matched = 0
     unmatched = 0
     producer_skipped = 0
     total_consumers = 0
+    violations: list[str] = []
+    invalid_records: list[dict] = []
+    connector_duplicates = 0  # cross-key + occurrence duplicates
+
+    def occ(ev: dict | None) -> int:
+        return int(ev.get("occurrences", 1)) if ev else 0
+
+    claimed: set[str] = set()           # connector keys claimed
+    prefetch_claimed: set[str] = set()  # prefetch keys claimed
+    dma_claimed: set[str] = set()       # DMA keys claimed
+
+    # Producer claims: warmup-seed connector/prefetch/DMA events are
+    # legitimate (they seeded the cache) — claim so they are not orphans.
+    for r in all_records:
+        if not r.get("producer"):
+            continue
+        client_req_id = r.get("req_id", "")
+        keys = [k for k in connector_by_req if client_req_id in k]
+        if len(keys) > 1:
+            violations.append(
+                f"duplicate connector event (producer): "
+                f"req={client_req_id} keys={keys}")
+        if keys:
+            claimed.add(keys[0])
+            if keys[0] in prefetch_by_req:
+                prefetch_claimed.add(keys[0])
+            if keys[0] in prefetch_dma_map:
+                dma_claimed.add(keys[0])
 
     for r in all_records:
         r.setdefault("hit_blocks", 0)
@@ -494,6 +660,9 @@ def merge_by_req_id(
         r.setdefault("dma_bytes", 0)
         r.setdefault("dma_ms", 0.0)
         r.setdefault("dma_gbps", 0.0)
+        # A2: per-request prefill/queue timing (informational, default -1)
+        r.setdefault("prefill_time_ms", -1.0)
+        r.setdefault("queue_time_ms", -1.0)
 
         if r.get("producer"):
             producer_skipped += 1
@@ -501,44 +670,363 @@ def merge_by_req_id(
 
         total_consumers += 1
         client_req_id = r.get("req_id", "")
-        cinfo = None
-        matched_conn_key = None
-        for conn_key, info in connector_by_req.items():
-            if client_req_id in conn_key:
-                cinfo = info
-                matched_conn_key = conn_key
-                break
+        keys = [k for k in connector_by_req if client_req_id in k]
 
-        if cinfo and matched_conn_key:
-            r["hit_blocks"] = cinfo["hit_blocks"]
-            r["hit_tokens"] = cinfo["hit_tokens"]
-            r["num_tokens_total"] = cinfo.get("num_tokens", 0)
-            server_req_id = matched_conn_key
-            if server_req_id in prefetch_by_req:
-                r["missing_blocks"] = prefetch_by_req[server_req_id]["missing_blocks"]
-            if server_req_id in prefetch_dma_map:
-                dma = prefetch_dma_map[server_req_id]
+        if not keys:
+            unmatched += 1
+            reason = f"missing connector event: req={client_req_id}"
+            r["_audit_invalid"] = True
+            r["_audit_reason"] = reason
+            violations.append(reason)
+            invalid_records.append({"req_id": client_req_id,
+                                    "reason": "missing connector event"})
+            continue
+
+        if len(keys) > 1:
+            connector_duplicates += len(keys) - 1
+            reason = (f"duplicate connector event: req={client_req_id} "
+                      f"keys={keys}")
+            r["_audit_invalid"] = True
+            r["_audit_reason"] = reason
+            violations.append(reason)
+            invalid_records.append({"req_id": client_req_id,
+                                    "reason": f"duplicate connector event ({len(keys)})"})
+
+        conn_key = keys[0]
+        cinfo = connector_by_req[conn_key]
+        claimed.add(conn_key)
+        matched += 1
+        r["hit_blocks"] = cinfo["hit_blocks"]
+        r["hit_tokens"] = cinfo["hit_tokens"]
+        r["num_tokens_total"] = cinfo.get("num_tokens", 0)
+        if timing_by_req:
+            t = timing_by_req.get(conn_key)
+            if t:
+                if "prefill_time_ms" in t:
+                    r["prefill_time_ms"] = t["prefill_time_ms"]
+                if "queue_time_ms" in t:
+                    r["queue_time_ms"] = t["queue_time_ms"]
+
+        # Prefetch: exactly one server-side prefetch for this connector
+        pref = prefetch_by_req.get(conn_key)
+        if pref is None:
+            reason = (f"missing prefetch event: req={client_req_id} "
+                      f"server={conn_key}")
+            r["_audit_invalid"] = True
+            r["_audit_reason"] = reason
+            violations.append(reason)
+            invalid_records.append({"req_id": client_req_id,
+                                    "reason": "missing prefetch event"})
+        else:
+            prefetch_claimed.add(conn_key)
+            if occ(pref) > 1:
+                reason = (f"duplicate prefetch event: server={conn_key} "
+                          f"occurrences={occ(pref)}")
+                r["_audit_invalid"] = True
+                r["_audit_reason"] = reason
+                violations.append(reason)
+                invalid_records.append({"req_id": client_req_id,
+                                        "reason": "duplicate prefetch event"})
+            r["missing_blocks"] = pref.get("missing_blocks", 0)
+
+        # DMA: required iff the request actually hit and transfers KV.
+        # A claimed hit with no DMA evidence is INVALID, not a silent 0.
+        dma = prefetch_dma_map.get(conn_key)
+        dma_required = r["hit_blocks"] > 0
+        if dma_required:
+            if dma is None:
+                reason = (f"missing DMA event: req={client_req_id} "
+                          f"hit_blocks={r['hit_blocks']} "
+                          f"(transfer claimed, no DMA evidence)")
+                r["_audit_invalid"] = True
+                r["_audit_reason"] = reason
+                violations.append(reason)
+                invalid_records.append({"req_id": client_req_id,
+                                        "reason": "missing DMA event"})
+            else:
+                dma_claimed.add(conn_key)
+                if occ(dma) > 1:
+                    reason = (f"duplicate DMA event: server={conn_key} "
+                              f"occurrences={occ(dma)}")
+                    r["_audit_invalid"] = True
+                    r["_audit_reason"] = reason
+                    violations.append(reason)
+                    invalid_records.append({"req_id": client_req_id,
+                                            "reason": "duplicate DMA event"})
                 r["dma_bytes"] = dma["dma_bytes"]
                 r["dma_ms"] = dma["dma_ms"]
                 r["dma_gbps"] = dma["dma_gbps"]
-            matched += 1
-        else:
-            unmatched += 1
+
+    # Orphan accounting: produced-but-unclaimed formal events
+    connector_orphans = [k for k in connector_by_req if k not in claimed]
+    for k in connector_orphans:
+        violations.append(f"orphan connector event: {k}")
+    prefetch_orphans = [k for k in prefetch_by_req if k not in prefetch_claimed]
+    for k in prefetch_orphans:
+        violations.append(f"orphan prefetch event: {k}")
+    dma_orphans = [k for k in prefetch_dma_map if k not in dma_claimed]
+    for k in dma_orphans:
+        violations.append(f"orphan DMA event: {k}")
+    if dma_leftover_count > 0:
+        violations.append(
+            f"leftover DMA completions: {dma_leftover_count} unbound to any prefetch")
+    if dma_fallback_only_count > 0:
+        # R6: per-copy fallback is NOT formal batch-DMA evidence — every
+        # such request is already flagged "missing DMA event" above.
+        violations.append(
+            f"fallback-only DMA (no batch DMA evidence): "
+            f"{dma_fallback_only_count} request(s)")
+
+    # Duplicates beyond the first occurrence, per event type.
+    # connector_duplicates also accumulates cross-key duplicates (two keys
+    # matching the same client req) from the consumer loop above.
+    connector_duplicates += sum(
+        occ(ev) - 1 for ev in connector_by_req.values() if occ(ev) > 1)
+    prefetch_duplicates = sum(
+        occ(ev) - 1 for ev in prefetch_by_req.values() if occ(ev) > 1)
+    dma_duplicates = sum(
+        occ(ev) - 1 for ev in prefetch_dma_map.values() if occ(ev) > 1)
 
     coverage_pct = (matched / total_consumers * 100.0
                     if total_consumers > 0 else 0.0)
+    # Fail-close: conservation breaks on ANY missing/duplicate/orphan/
+    # leftover formal event, on unmatched consumers, and on records whose
+    # evidence chain is broken — coverage alone is not enough.
+    conservation_ok = (
+        unmatched == 0 and not invalid_records
+        and not connector_orphans and not prefetch_orphans and not dma_orphans
+        and connector_duplicates == 0 and prefetch_duplicates == 0
+        and dma_duplicates == 0 and dma_leftover_count == 0
+        and dma_fallback_only_count == 0
+    )
     return {
         "matched": matched,
         "unmatched": unmatched,
         "producer_skipped": producer_skipped,
         "total_consumers": total_consumers,
         "coverage_pct": round(coverage_pct, 1),
+        "connector_total": len(connector_by_req),
+        "connector_consumed": len(claimed),
+        "connector_duplicates": connector_duplicates,
+        "connector_orphans": len(connector_orphans),
+        "prefetch_total": len(prefetch_by_req),
+        "prefetch_consumed": len(prefetch_claimed),
+        "prefetch_duplicates": prefetch_duplicates,
+        "prefetch_orphans": len(prefetch_orphans),
+        "dma_total": len(prefetch_dma_map),
+        "dma_consumed": len(dma_claimed),
+        "dma_duplicates": dma_duplicates,
+        "dma_orphans": len(dma_orphans),
+        "dma_leftover": dma_leftover_count,
+        "dma_fallback_only": dma_fallback_only_count,
+        "conservation_ok": conservation_ok,
+        "violations": violations,
+        "invalid_records": invalid_records,
     }
+
+
+def bind_dma_to_prefetch(
+    ts_prefetches: list[dict],
+    ts_dmas: list[dict],
+    connector_by_req: dict[str, dict],
+    label_to_npu: dict[str, int],
+    dma_time_window_s: float = DMA_TIME_WINDOW_S,
+) -> tuple[dict, int, int, list[str]]:
+    """Bind DMA completions to prefetch events (pure — R9).
+
+    Nearest subsequent DMA on the same device + same arm + within the time
+    window binds to each hit>0 prefetch, 1:1 (bound DMA is consumed).
+
+    R6: a per-copy fallback line is NOT formal batch-DMA evidence — a hit
+    prefetch with only a fallback candidate binds nothing and is counted in
+    fallback_only_count; merge_by_req_id then flags it "missing DMA event"
+    and marks the record _audit_invalid.
+
+    Returns (prefetch_dma_map, fallback_only_count, leftover_count,
+             violations). Mutates ts_dmas (consumes bound entries).
+    """
+    prefetch_dma_map: dict[str, dict] = {}
+    fallback_only_count = 0
+    violations: list[str] = []
+    ts_fmt = "%Y-%m-%dT%H:%M:%S.%f"
+
+    for pf in ts_prefetches:
+        if pf["hit"] == 0:
+            continue  # no DMA for miss
+        req_id = pf["req_id"]
+        # Target device from connector label (label format: C1_shared_3 → NPU 3)
+        target_device = None
+        if req_id in connector_by_req:
+            target_device = label_to_npu.get(
+                connector_by_req[req_id].get("label", ""), None
+            )
+        pf_arm = pf.get("arm_label", "")
+        best, best_fallback = None, None
+        for dma in ts_dmas:
+            if dma["ts"] <= pf["ts"]:
+                continue
+            if dma.get("arm_label", "") != pf_arm:
+                continue  # P1-4: arm scope
+            if target_device is not None and dma["device_id"] != target_device:
+                continue  # P1-4: device scope
+            # P1-4 / P2-3: full ISO timestamp time window (cross-minute safe).
+            try:
+                pf_dt = datetime.strptime(pf["ts"][:26], ts_fmt)
+                dma_dt = datetime.strptime(dma["ts"][:26], ts_fmt)
+                if abs((dma_dt - pf_dt).total_seconds()) > dma_time_window_s:
+                    continue
+            except (ValueError, IndexError):
+                pass
+            if dma.get("fallback"):
+                if best_fallback is None or dma["ts"] < best_fallback["ts"]:
+                    best_fallback = dma
+            else:
+                if best is None or dma["ts"] < best["ts"]:
+                    best = dma
+        if best is None:
+            # R6: fallback-only is not formal evidence — no binding.
+            if best_fallback is not None:
+                fallback_only_count += 1
+                violations.append(
+                    f"fallback-only DMA (no batch DMA evidence): req={req_id}")
+                try:
+                    ts_dmas.remove(best_fallback)
+                except ValueError:
+                    pass
+            continue
+        # P2-6: two DMA completions for the same prefetch → count, not overwrite.
+        entry = prefetch_dma_map.get(req_id)
+        if entry is not None:
+            entry["occurrences"] = entry.get("occurrences", 1) + 1
+            continue
+        prefetch_dma_map[req_id] = {
+            "dma_ms": best["dma_ms"],
+            "dma_bytes": best["dma_bytes"],
+            "dma_gbps": best["dma_gbps"],
+            "occurrences": 1,
+        }
+        ts_dmas.remove(best)  # consume — one DMA per prefetch
+
+    return prefetch_dma_map, fallback_only_count, len(ts_dmas), violations
+
+
+def monitor_admission_drift(
+    admitted: list[int],
+    free_mb_pre: dict[int, int],
+    expected_used_mb_by_npu: dict[int, int],
+    tracked_pgids_set: set[int],
+    stop_event: threading.Event,
+    violations_out: list[str],
+    interval_s: float = ADMISSION_POLL_INTERVAL_S,
+    sampler=None,
+    pgid_of=os.getpgid,
+) -> None:
+    """Periodically re-verify admission during a phase (P2-6/R7).
+
+    Boundary sampling misses transient drift mid-phase; this thread polls
+    check_admission_drift every interval_s until stop_event is set. Every
+    drift found is printed as [INVALID] and appended to violations_out
+    (the run then exits non-zero at the final gate).
+
+    sampler() -> (free_mb_now, npu_procs) — injectable for host-only tests.
+    """
+    def _sample() -> tuple[dict[int, int], dict[int, list[int]]]:
+        return get_npu_free_memory(), get_npu_processes()
+
+    sampler = sampler or _sample
+    while not stop_event.wait(interval_s):
+        try:
+            free_now, npu_procs = sampler()
+        except Exception as e:
+            violations_out.append(f"admission monitor sample failed: {e}")
+            continue
+        drift = check_admission_drift(
+            admitted, free_mb_pre, free_now, expected_used_mb_by_npu,
+            npu_procs, tracked_pgids_set, pgid_of=pgid_of)
+        for v in drift:
+            print(f"  [INVALID] {v}")
+            violations_out.append(v)
 
 
 # =========================================================================
 # Statistics
 # =========================================================================
+
+def compute_paired_analysis(shared: list[dict], isolated: list[dict]) -> dict:
+    """Per-query-class paired analysis (prereg §4.1/§4.4, C5, D5).
+
+    Inputs: consumer records (ok, ttft_s > 0) of ONE query class, per arm.
+    Pairing key: (cycle, physical_npu) — each NPU is a consumer instance in
+    both arms (D5). Everything else is derived from the per-instance paired
+    deltas: median prefill saving, per-instance median deltas, and a
+    lifecycle cluster bootstrap CI (one mean-delta per cycle, resampled 1000
+    times, seed 42 — C5: stratified per query class, producers excluded).
+
+    Returns dict with n, medians, prefill_saved_ms, dma_cost_ms,
+    per_instance_deltas_ms, cluster_ci (low, high), significant, verdict
+    ('GO' when prefill_saved > dma_cost AND CI excludes 0, else 'BREAK-EVEN').
+    """
+    def _by(recs):
+        return {(r.get("cycle"), r.get("npu")): r for r in recs}
+
+    s_map, i_map = _by(shared), _by(isolated)
+    pairs = []
+    for key in sorted(set(s_map) & set(i_map)):
+        s, i = s_map[key], i_map[key]
+        pairs.append((key, i["ttft_s"] - s["ttft_s"]))
+    deltas_ms = [d * 1000.0 for _, d in pairs]
+
+    # Per-instance median paired delta (D5)
+    per_inst: dict[int, list[float]] = {}
+    for (_, npu), d in pairs:
+        per_inst.setdefault(npu, []).append(d * 1000.0)
+    per_instance_deltas_ms = {
+        npu: sorted(v)[len(v) // 2] for npu, v in sorted(per_inst.items())}
+
+    # Lifecycle cluster bootstrap CI, stratified per class (C5)
+    cluster_deltas: dict[int, list[float]] = {}
+    for (cycle, _), d in pairs:
+        cluster_deltas.setdefault(cycle, []).append(d * 1000.0)
+    cluster_means = [sum(v) / len(v) for v in cluster_deltas.values()]
+    if cluster_means:
+        random.seed(42)
+        boot = []
+        for _ in range(1000):
+            sample = [random.choice(cluster_means) for __ in range(len(cluster_means))]
+            boot.append(sum(sample) / len(sample))
+        boot.sort()
+        cluster_ci = (round(boot[25], 1), round(boot[974], 1))
+        significant = cluster_ci[0] > 0 or cluster_ci[1] < 0
+    else:
+        cluster_ci = (0.0, 0.0)
+        significant = False
+
+    # Break-even: prefill_saved vs DMA cost (prereg §4.4)
+    s_vals = sorted(r["ttft_s"] for r in shared)
+    i_vals = sorted(r["ttft_s"] for r in isolated)
+    s_med = s_vals[len(s_vals) // 2] if s_vals else 0.0
+    i_med = i_vals[len(i_vals) // 2] if i_vals else 0.0
+    prefill_saved_ms = (i_med - s_med) * 1000.0
+    dma_vals = [r.get("dma_ms", 0) for r in shared if r.get("dma_ms", 0) > 0]
+    dma_cost_ms = (sum(dma_vals) / len(dma_vals)) if dma_vals else None
+
+    if dma_cost_ms is not None and prefill_saved_ms > dma_cost_ms and significant:
+        verdict = "GO"
+    else:
+        verdict = "BREAK-EVEN"
+
+    return {
+        "n": len(pairs),
+        "shared_median": round(s_med, 4),
+        "isolated_median": round(i_med, 4),
+        "prefill_saved_ms": round(prefill_saved_ms, 1),
+        "dma_cost_ms": (round(dma_cost_ms, 1) if dma_cost_ms is not None else None),
+        "per_instance_deltas_ms": per_instance_deltas_ms,
+        "cluster_ci": cluster_ci,
+        "significant": significant,
+        "verdict": verdict,
+    }
+
 
 def compute_stats(records: list[dict], key="ttft_s") -> dict:
     vals = sorted(r[key] for r in records if r.get(key, -1) > 0)
@@ -570,8 +1058,14 @@ def compute_stats(records: list[dict], key="ttft_s") -> dict:
 # Summary + break-even
 # =========================================================================
 
-def write_summary(env_info, all_records, negative_examples, merge_result, out_dir):
-    """Write trace_summary.md with median/CI and break-even analysis."""
+def write_summary(env_info, all_records, negative_examples, merge_result,
+                  out_dir, drift_violations=None):
+    """Write trace_summary.md with median/CI and break-even analysis.
+
+    Returns True if every validity gate passes (fail-close), else False —
+    the caller must then exit non-zero.
+    """
+    drift_violations = drift_violations or []
     # P2-5: separate producer (warmup seed) from consumer (cross-instance).
     # Producer records seed the shared cache but are not themselves consumers.
     shared = [r for r in all_records
@@ -589,8 +1083,10 @@ def write_summary(env_info, all_records, negative_examples, merge_result, out_di
         "# Trace Audit Summary",
         "",
         "## Environment",
-        f"- Commit: `{env_info.get('git_commit','?')[:12]}`",
+        f"- Commit: `{env_info.get('git_commit','?')[:12]}` "
+        f"(parent: `{env_info.get('git_parent','?')[:12]}`)",
         f"- Branch: `{env_info.get('git_branch','?')}`",
+        f"- Runtime vLLM commit: `{env_info.get('runtime_commit_vllm','?')[:12]}`",
         f"- Model: `{env_info.get('model','?')}` "
         f"(md5: `{env_info.get('model_config_md5','?')[:12]}`)",
         f"- Timestamp: {env_info.get('timestamp','?')}",
@@ -598,26 +1094,30 @@ def write_summary(env_info, all_records, negative_examples, merge_result, out_di
         "",
         "## TTFT (Time-To-First-Token)",
         "",
-        "| Phase | N | Median | Mean | 95% CI | Min | Max |",
-        "|---|---|---|---|---|---|---|",
+        "| Phase | N | Median | Mean | IQR | 95% CI | Min | Max |",
+        "|---|---|---|---|---|---|---|---|",
         f"| Shared | {ttft_s['n']} | **{ttft_s['median']:.4f}s** | "
-        f"{ttft_s['mean']:.4f}s | [{ttft_s['ci_95_low']:.4f}, "
+        f"{ttft_s['mean']:.4f}s | {ttft_s['iqr']:.4f}s | "
+        f"[{ttft_s['ci_95_low']:.4f}, "
         f"{ttft_s['ci_95_high']:.4f}] | {ttft_s['min']:.4f}s | "
         f"{ttft_s['max']:.4f}s |",
         f"| Isolated | {ttft_i['n']} | **{ttft_i['median']:.4f}s** | "
-        f"{ttft_i['mean']:.4f}s | [{ttft_i['ci_95_low']:.4f}, "
+        f"{ttft_i['mean']:.4f}s | {ttft_i['iqr']:.4f}s | "
+        f"[{ttft_i['ci_95_low']:.4f}, "
         f"{ttft_i['ci_95_high']:.4f}] | {ttft_i['min']:.4f}s | "
         f"{ttft_i['max']:.4f}s |",
         "",
         "## Total Latency",
         "",
-        "| Phase | N | Median | Mean | 95% CI |",
-        "|---|---|---|---|---|",
+        "| Phase | N | Median | Mean | IQR | 95% CI |",
+        "|---|---|---|---|---|---|",
         f"| Shared | {total_s['n']} | {total_s['median']:.3f}s | "
-        f"{total_s['mean']:.3f}s | [{total_s['ci_95_low']:.3f}, "
+        f"{total_s['mean']:.3f}s | {total_s['iqr']:.3f}s | "
+        f"[{total_s['ci_95_low']:.3f}, "
         f"{total_s['ci_95_high']:.3f}] |",
         f"| Isolated | {total_i['n']} | {total_i['median']:.3f}s | "
-        f"{total_i['mean']:.3f}s | [{total_i['ci_95_low']:.3f}, "
+        f"{total_i['mean']:.3f}s | {total_i['iqr']:.3f}s | "
+        f"[{total_i['ci_95_low']:.3f}, "
         f"{total_i['ci_95_high']:.3f}] |",
         "",
     ]
@@ -633,30 +1133,36 @@ def write_summary(env_info, all_records, negative_examples, merge_result, out_di
         "",
     ]
     for qidx in sorted(set(r["query_idx"] for r in all_records)):
-        s_subset = [r for r in shared if r.get("query_idx") == qidx and r.get("ok")]
-        i_subset = [r for r in isolated if r.get("query_idx") == qidx and r.get("ok")]
-        s_vals = sorted(r["ttft_s"] for r in s_subset)
-        i_vals = sorted(r["ttft_s"] for r in i_subset)
-        if s_vals and i_vals:
-            s_med = s_vals[len(s_vals)//2]
-            i_med = i_vals[len(i_vals)//2]
-            paired_delta = (i_med - s_med) / i_med * 100 if i_med > 0 else 0
-            # Per-request DMA for this query class only
-            dma_vals = [r.get("dma_ms", 0) for r in s_subset
-                        if r.get("dma_ms", 0) > 0]
-            dma_fallbacks = sum(1 for r in s_subset if r.get("dma_ms", 0) < 0)
-            dma_paired = sum(dma_vals) / len(dma_vals) if dma_vals else 0
-            dma_note = (f"{dma_paired:.1f}ms" if dma_vals
-                        else f"per-copy fallback ({dma_fallbacks} DMA no timing)")
-            s_mean = sum(s_vals) / len(s_vals)
-            i_mean = sum(i_vals) / len(i_vals)
+        s_subset = [r for r in shared if r.get("query_idx") == qidx
+                    and r.get("ok") and r.get("ttft_s", -1) > 0]
+        i_subset = [r for r in isolated if r.get("query_idx") == qidx
+                    and r.get("ok") and r.get("ttft_s", -1) > 0]
+        if not s_subset or not i_subset:
             lines += [
                 f"### Q{qidx}",
-                f"- Shared: n={len(s_vals)}, median={s_med:.4f}s, mean={s_mean:.4f}s",
-                f"- Isolated: n={len(i_vals)}, median={i_med:.4f}s, mean={i_mean:.4f}s",
-                f"- Paired delta: {paired_delta:+.1f}% ({(i_med - s_med)*1000:.0f}ms median)",
-                f"- DMA (per-request, timestamp-bound): {dma_note}",
+                "- No paired observations (arm aborted by fail-close).",
+                "- Verdict: BREAK-EVEN (no data)",
             ]
+            continue
+        pa = compute_paired_analysis(s_subset, i_subset)
+        per_inst_str = ", ".join(
+            f"NPU{npu}:{d:+.1f}ms" for npu, d in pa["per_instance_deltas_ms"].items())
+        dma_note = (f"{pa['dma_cost_ms']:.1f}ms" if pa["dma_cost_ms"] is not None
+                    else "n/a (no DMA evidence)")
+        ci_note = (f"CI [{pa['cluster_ci'][0]:.1f}, {pa['cluster_ci'][1]:.1f}]ms "
+                   f"{'excludes 0' if pa['significant'] else 'includes 0'}")
+        lines += [
+            f"### Q{qidx}",
+            f"- Shared: n={len(s_subset)}, median={pa['shared_median']:.4f}s",
+            f"- Isolated: n={len(i_subset)}, median={pa['isolated_median']:.4f}s",
+            f"- Prefill saved (median): {pa['prefill_saved_ms']:+.1f}ms",
+            f"- DMA cost (per-request, bound): {dma_note}",
+            f"- Per-instance median paired delta (D5): {per_inst_str}",
+            f"- Lifecycle cluster CI, per query class (C5): {ci_note}",
+            f"- Break-even (prereg §4.4): "
+            f"{'prefill_saved > dma_cost AND significant' if pa['verdict'] == 'GO' else 'prefill_saved <= dma_cost OR not significant'} "
+            f"-> **{pa['verdict']}**",
+        ]
 
     lines += [
         "",
@@ -718,18 +1224,24 @@ def write_summary(env_info, all_records, negative_examples, merge_result, out_di
             "",
             f"## Per-Query TTFT: Q{qidx}",
             "",
-            "| Phase | N | Median | Mean | 95% CI |",
-            "|---|---|---|---|---|",
+            "| Phase | N | Median | Mean | IQR | 95% CI |",
+            "|---|---|---|---|---|---|",
         ]
         for phase_name in ["shared", "isolated"]:
             subset = [r for r in all_records
                       if r.get("phase") == phase_name
                       and r.get("query_idx") == qidx
                       and r.get("ok")]
+            if not subset:
+                # Empty subset (e.g. an arm aborted by fail-close) must not
+                # crash before the validity manifest is written.
+                lines.append(f"| {phase_name} | 0 | — | — | — | — |")
+                continue
             stats = compute_stats(subset, "ttft_s")
             lines.append(
                 f"| {phase_name} | {stats['n']} | "
                 f"**{stats['median']:.4f}s** | {stats['mean']:.4f}s | "
+                f"{stats['iqr']:.4f}s | "
                 f"[{stats['ci_95_low']:.4f}, {stats['ci_95_high']:.4f}] |"
             )
 
@@ -755,7 +1267,9 @@ def write_summary(env_info, all_records, negative_examples, merge_result, out_di
         "",
     ]
 
-    # Producer (warmup seed) stats
+    # Producer (warmup seed) stats — default so the manifest renders even
+    # when fail-close aborted before any producer record was produced.
+    p_ttft = {"n": 0, "median": 0, "mean": 0}
     if producers:
         p_ttft = compute_stats(producers, "ttft_s")
         lines += [
@@ -768,16 +1282,32 @@ def write_summary(env_info, all_records, negative_examples, merge_result, out_di
             "- They seed the shared cache but are not themselves cross-instance consumers.",
         ]
 
-    # Validity manifest (coverage gate included — P2-3)
-    validity_ok = (
+    # Validity manifest (coverage + conservation gates — P2-3/P2-6)
+    base_ok = (
         ttft_s["n"] >= 12 and ttft_i["n"] >= 12
         and len(all_records) > 0
-        and merge_result.get("coverage_pct", 0) >= 100.0
     )
+    evidence_ok = (
+        merge_result.get("conservation_ok", False)
+        and merge_result.get("coverage_pct", 0) >= 100.0
+        and merge_result.get("unmatched", 0) == 0
+        and not drift_violations
+    )
+    validity_ok = base_ok and evidence_ok
     if merge_result.get("coverage_pct", 0) < 100.0:
         lines.append(
             f"- Coverage gate FAILED: {merge_result['coverage_pct']:.1f}% "
             f"(requires 100%)")
+    lines += [
+        "",
+        "## Evidence Violations (Fail-Close)",
+    ]
+    all_violations = merge_result.get("violations", []) + list(drift_violations)
+    if not all_violations:
+        lines.append("- None — all connector/prefetch/DMA events unique and conserved.")
+    else:
+        for v in all_violations:
+            lines.append(f"- [INVALID] {v}")
     lines += [
         "",
         "## Validity Manifest",
@@ -787,7 +1317,18 @@ def write_summary(env_info, all_records, negative_examples, merge_result, out_di
         f"- Consumer isolated records: {ttft_i['n']}",
         f"- Producer records: {p_ttft['n']}",
         f"- INVALID records: {sum(1 for r in all_records if not r.get('ok'))}",
+        f"- Audit-invalid records (evidence): "
+        f"{sum(1 for r in all_records if r.get('_audit_invalid'))}",
+        f"- Conservation: "
+        f"{'OK' if merge_result.get('conservation_ok') else 'BROKEN'} "
+        f"(connector dup={merge_result.get('connector_duplicates', 0)}, "
+        f"orphans={merge_result.get('connector_orphans', 0)}/"
+        f"{merge_result.get('prefetch_orphans', 0)}/"
+        f"{merge_result.get('dma_orphans', 0)}, "
+        f"leftover DMA={merge_result.get('dma_leftover', 0)}, "
+        f"fallback-only DMA={merge_result.get('dma_fallback_only', 0)})",
         f"- Validity gate: {'PASS' if validity_ok else 'FAIL'}",
+        f"- Audit verdict: {'VALID' if validity_ok else 'INVALID'}",
     ]
 
     lines += [
@@ -802,6 +1343,18 @@ def write_summary(env_info, all_records, negative_examples, merge_result, out_di
     summary_path = out_dir / "trace_summary.md"
     summary_path.write_text("\n".join(lines) + "\n")
     print(f"\nSummary: {summary_path}")
+    return validity_ok
+
+
+def fail_close(reasons: list[str]) -> None:
+    """Print every gate failure as [INVALID] and exit non-zero (fail-close).
+
+    P2-6: a run with broken evidence is never released as PASS — summary
+    must already be written so the artifact documents the INVALID verdict.
+    """
+    for reason in reasons:
+        print(f"  [INVALID] {reason}")
+    sys.exit(1)
 
 
 # =========================================================================
@@ -850,6 +1403,7 @@ def main():
     # PegaFlow with symmetric namespace configuration.
     # ------------------------------------------------------------------
     all_records: list[dict] = []
+    drift_violations: list[str] = []  # P2-6: mid-arm admission drift
     ARM_ORDER = [
         # cycle 1: AB, cycle 2: BA, cycle 3: AB, ...
         [("shared", True), ("isolated", False)],
@@ -929,11 +1483,66 @@ def main():
                     kill_tracked()
                     time.sleep(5)
                     continue
-                records = run_phase_sequential(
-                    arm_name, running, queries, model_path,
-                    warmup_first=True, cycle=cycle,  # symmetric warmup
+
+                # P2-6: re-verify admission right after launch — owner PID
+                # and HBM must still hold for every admitted device.
+                drift = check_admission_drift(
+                    admitted, free_mem, get_npu_free_memory(),
+                    {i: expected_used_mb(i, free_mem) for i in admitted},
+                    get_npu_processes(), tracked_pgids())
+                if drift:
+                    print(f"  [INVALID] Admission drift after launch — "
+                          f"arm {arm_label} ABORTED.")
+                    for v in drift:
+                        print(f"  [INVALID] {v}")
+                    drift_violations.extend(drift)
+                    for _, proc in running:
+                        stop_proc(proc)
+                    all_records.append({
+                        "cycle": cycle, "phase": arm_name, "req_idx": -1,
+                        "query_idx": -1, "instance": "INVALID", "npu": -1,
+                        "port": -1, "query": "", "ttft_s": -1, "total_s": -1,
+                        "ok": False, "text": "",
+                        "error": "admission drift: " + "; ".join(drift)[:200],
+                        "producer": False,
+                    })
+                    stop_proc(server)
+                    kill_tracked()
+                    time.sleep(5)
+                    continue
+                # R7: periodic drift polling DURING the phase — boundary
+                # samples miss transient mid-phase drift. The monitor thread
+                # polls check_admission_drift until the phase ends.
+                stop_event = threading.Event()
+                monitor_out: list[str] = []
+                monitor = threading.Thread(
+                    target=monitor_admission_drift,
+                    args=(admitted, free_mem,
+                          {i: expected_used_mb(i, free_mem) for i in admitted},
+                          tracked_pgids(), stop_event, monitor_out),
+                    daemon=True,
                 )
+                monitor.start()
+                try:
+                    records = run_phase_sequential(
+                        arm_name, running, queries, model_path,
+                        warmup_first=True, cycle=cycle,  # symmetric warmup
+                    )
+                finally:
+                    stop_event.set()
+                    monitor.join(timeout=5)
                 all_records.extend(records)
+                drift_violations.extend(monitor_out)
+
+                # P2-6: post-phase admission re-check (owner PID + HBM).
+                # Drift here invalidates the arm's formal evidence.
+                drift = check_admission_drift(
+                    admitted, free_mem, get_npu_free_memory(),
+                    {i: expected_used_mb(i, free_mem) for i in admitted},
+                    get_npu_processes(), tracked_pgids())
+                drift_violations.extend(drift)
+                for v in drift:
+                    print(f"  [INVALID] {v}")
                 for _, proc in running:
                     stop_proc(proc)
                 print(f"  {arm_label}: {len(records)} records")
@@ -955,9 +1564,11 @@ def main():
     # Step 1: Extract connector cache_lookup from each vLLM log
     # Format: [PegaKVConnector] req=<req_id> cache_lookup: hit_blocks=N ...
     connector_by_req: dict[str, dict] = {}  # req_id -> {label, hit_blocks, hit_tokens, num_tokens}
+    timing_by_req: dict[str, dict] = {}     # req_id -> {prefill_time_ms, queue_time_ms} (A2)
     for vllm_log in sorted((LOG_DIR).glob("vllm_*.log")):
         label = vllm_log.name.replace("vllm_", "").replace(".log", "")
         text = vllm_log.read_text()
+        timing_by_req.update(extract_vllm_timing(text))
         for m in re.finditer(
             r"\[PegaKVConnector\] req=(?P<req_id>\S+)\s+"
             r"cache_lookup: hit_blocks=(?P<hit>\d+) "
@@ -966,6 +1577,12 @@ def main():
             text,
         ):
             req_id = m.group("req_id")
+            # P2-6: count occurrences instead of silently overwriting —
+            # duplicate connector events must be reported, not last-wins.
+            entry = connector_by_req.get(req_id)
+            if entry is not None:
+                entry["occurrences"] = entry.get("occurrences", 1) + 1
+                continue
             connector_by_req[req_id] = {
                 "req_id": req_id,
                 "label": label,
@@ -973,6 +1590,7 @@ def main():
                 "computed_blocks": int(m.group("computed")),
                 "hit_tokens": int(m.group("hit_tokens")),
                 "num_tokens": int(m.group("num_tokens")),
+                "occurrences": 1,
             }
 
     # Step 2: Extract prefetch + DMA from per-arm server logs, keeping
@@ -981,7 +1599,6 @@ def main():
     prefetch_by_req: dict[str, dict] = {}
     ts_prefetches: list[dict] = []   # {ts, req_id, arm_label, hit, missing}
     ts_dmas: list[dict] = []         # {ts, device_id, arm_label, dma_ms, ...}
-    DMA_TIME_WINDOW_S = 30.0         # max seconds between prefetch and DMA
 
     # Read from all per-arm log directories
     for arm_log_dir in sorted(LOG_DIR.glob("arm_*")):
@@ -1000,10 +1617,18 @@ def main():
             r"missing=(?P<missing>\d+)",
             text,
         ):
-            prefetch_by_req[m.group("req_id")] = {
+            req_id = m.group("req_id")
+            # P2-6: count occurrences — duplicate prefetch events must be
+            # reported, not silently overwritten.
+            pf_entry = prefetch_by_req.get(req_id)
+            if pf_entry is not None:
+                pf_entry["occurrences"] = pf_entry.get("occurrences", 1) + 1
+                continue
+            prefetch_by_req[req_id] = {
                 "total_keys": int(m.group("total")),
                 "hit_blocks": int(m.group("hit")),
                 "missing_blocks": int(m.group("missing")),
+                "occurrences": 1,
             }
 
         # Parse timestamped events for DMA binding (per-arm scope)
@@ -1062,10 +1687,9 @@ def main():
                         "fallback": True,
                     })
 
-    # Step 4: Bind DMA to prefetch by req_id matching via connector label→NPU
-    # connector_by_req maps req_id → {label: "C1_shared_3", ...}
-    # DMA has device_id (NPU ID); we map label → npu via instance_specs
-    # Build label→npu map from all instance labels seen in connector entries
+    # Step 4: Bind DMA to prefetch (pure function — R9). connector_by_req
+    # maps req_id → {label: "C1_shared_3", ...}; DMA has device_id (NPU ID),
+    # mapped via label→npu built from instance labels.
     label_to_npu: dict[str, int] = {}
     for cinfo in connector_by_req.values():
         label = cinfo.get("label", "")
@@ -1077,76 +1701,36 @@ def main():
             except ValueError:
                 pass
 
-    prefetch_dma_map: dict[str, dict] = {}  # req_id -> {dma_ms, dma_bytes, dma_gbps}
-    for pf in ts_prefetches:
-        if pf["hit"] == 0:
-            continue  # no DMA for miss
-        req_id = pf["req_id"]
-        # Get target device from connector label
-        target_device = None
-        if req_id in connector_by_req:
-            target_device = label_to_npu.get(
-                connector_by_req[req_id].get("label", ""), None
-            )
-        # Find nearest subsequent DMA on same device + same arm + within time window.
-        pf_arm = pf.get("arm_label", "")
-        best, best_fallback = None, None
-        for dma in ts_dmas:
-            if dma["ts"] <= pf["ts"]:
-                continue
-            if dma.get("arm_label", "") != pf_arm:
-                continue  # P1-4: arm scope
-            if target_device is not None and dma["device_id"] != target_device:
-                continue  # P1-4: device scope
-            # P1-4 / P2-3: time window using full ISO timestamp parse.
-            # Prior version only compared the seconds field (split(":")[-1]),
-            # which breaks across minute boundaries (10:05:59 vs 10:06:01).
-            try:
-                from datetime import datetime
-                ts_fmt = "%Y-%m-%dT%H:%M:%S.%f"
-                pf_dt = datetime.strptime(pf["ts"][:26], ts_fmt)
-                dma_dt = datetime.strptime(dma["ts"][:26], ts_fmt)
-                if abs((dma_dt - pf_dt).total_seconds()) > DMA_TIME_WINDOW_S:
-                    continue
-            except (ValueError, IndexError):
-                pass
-            if dma.get("fallback"):
-                if best_fallback is None or dma["ts"] < best_fallback["ts"]:
-                    best_fallback = dma
-            else:
-                if best is None or dma["ts"] < best["ts"]:
-                    best = dma
-        # Prefer real timing; fall back to per-copy if no timing available
-        if best is None:
-            best = best_fallback
-        if best:
-            dma_ms = best["dma_ms"]
-            dma_bytes = best["dma_bytes"]
-            dma_gbps = best["dma_gbps"]
-            # -1 signals "DMA happened via per-copy fallback, timing unavailable"
-            if best.get("fallback") and dma_ms <= 0.0:
-                dma_ms = -1.0
-                dma_bytes = 1434451968  # known block size for 76 blocks
-                dma_gbps = 0.0
-            prefetch_dma_map[req_id] = {
-                "dma_ms": dma_ms,
-                "dma_bytes": dma_bytes,
-                "dma_gbps": dma_gbps,
-            }
-            ts_dmas.remove(best)  # consume — one DMA per prefetch
+    prefetch_dma_map, fallback_only_count, dma_leftover, bind_violations = \
+        bind_dma_to_prefetch(ts_prefetches, ts_dmas, connector_by_req,
+                             label_to_npu)
+    for v in bind_violations:
+        print(f"  [INVALID] {v}")
 
     # Step 5: Merge per-request by client-generated request_id (pure function).
+    # Fail-close (P2-6): any missing/duplicate/orphan formal event or
+    # coverage < 100% invalidates the run — reported here, and the process
+    # exits non-zero after the summary is written.
     merge_result = merge_by_req_id(all_records, connector_by_req,
-                                   prefetch_by_req, prefetch_dma_map)
+                                   prefetch_by_req, prefetch_dma_map,
+                                   dma_leftover_count=dma_leftover,
+                                   dma_fallback_only_count=fallback_only_count,
+                                   timing_by_req=timing_by_req)
     print(f"  Merged hit/DMA: {merge_result['matched']} records via req_id lookup "
           f"(unmatched={merge_result['unmatched']}, "
           f"producer_skipped={merge_result['producer_skipped']}, "
-          f"coverage={merge_result['coverage_pct']:.1f}%)")
+          f"coverage={merge_result['coverage_pct']:.1f}%, "
+          f"conservation={'OK' if merge_result['conservation_ok'] else 'BROKEN'}, "
+          f"conn_dup={merge_result['connector_duplicates']}, "
+          f"orphans={merge_result['connector_orphans']}/"
+          f"{merge_result['prefetch_orphans']}/"
+          f"{merge_result['dma_orphans']}, "
+          f"leftover_dma={merge_result['dma_leftover']}, "
+          f"fallback_only={merge_result['dma_fallback_only']})")
 
-    # Coverage gate: non-zero exit if coverage != 100%
-    if merge_result["coverage_pct"] < 100.0:
-        print(f"  [WARNING] Request/DMA coverage is {merge_result['coverage_pct']:.1f}%, "
-              f"not 100%. {merge_result['unmatched']} consumer records could not be matched.")
+    # Fail-close: every evidence violation is printed as [INVALID] now.
+    for v in merge_result["violations"]:
+        print(f"  [INVALID] {v}")
 
     # ------------------------------------------------------------------
     # Negative examples: burst + MLA from previous benchmarks
@@ -1185,7 +1769,11 @@ def main():
         json.dump(output, f, indent=2, default=str)
     print(f"Raw data: {out_json} ({len(all_records)} records)")
 
-    write_summary(env_info, all_records, negative_examples, merge_result, OUT_DIR)
+    summary_ok = write_summary(env_info, all_records, negative_examples,
+                               merge_result, OUT_DIR, drift_violations)
+
+    if not summary_ok:
+        fail_close([f"validity gate FAILED — see {OUT_DIR / 'trace_summary.md'}"])
 
     print("\n" + "=" * 70)
     print("  Trace audit complete.")
