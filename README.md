@@ -48,10 +48,17 @@ ledgers.
 
 ### 1. Install
 
+For this repository's HUST Ascend branch, build from source:
+
 ```bash
-uv pip install pegaflow-llm        # CUDA 12
-uv pip install pegaflow-llm-cu13   # CUDA 13
+cd python
+uv run maturin develop -r --no-default-features --features ascend
 ```
+
+The published `pegaflow-llm` and `pegaflow-llm-cu13` packages belong to the
+[upstream Novita project](https://github.com/novitalabs/pegaflow) and target
+CUDA. The HUST package is named `pegaflow-llm-npu` in `python/pyproject.toml`,
+but is not currently published to PyPI.
 
 ### 2. Start PegaFlow Server
 
@@ -78,7 +85,7 @@ vllm serve Qwen/Qwen3-0.6B \
 export PYO3_PYTHON=$(which python)
 export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
 
-cargo run -r                    # start server
+cargo run -r -p pegaflow-server # start server
 cd python && maturin develop -r # build Python bindings
 ```
 
@@ -86,25 +93,44 @@ The default source build targets CUDA 12.8. If your environment uses CUDA 13,
 disable the default CUDA feature and enable `cuda-13` explicitly:
 
 ```bash
-cargo run -r --no-default-features --features cuda-13 --bin pegaflow-server
+cargo run -r -p pegaflow-server --no-default-features --features cuda-13
 cd python && uv run maturin develop -r --no-default-features --features cuda-13
 ./scripts/build-wheel.sh --release --no-default-features --features cuda-13
+```
+
+For the HUST Ascend path, disable the default CUDA/RDMA features and select
+`ascend` explicitly:
+
+```bash
+cargo run -r -p pegaflow-server --no-default-features --features ascend
+cd python && uv run maturin develop -r --no-default-features --features ascend
 ```
 
 We use [Conventional Commits](https://www.conventionalcommits.org/) — run `cz c` for an interactive commit prompt.
 
 ## Benchmarks
 
-### KV Cache Benchmark
+### Upstream CUDA Reference Benchmark
 
-H800 reference numbers with Llama-3.1-8B (8 prompts, 10K-token prefill, 1-token decode, 4.0 req/s):
+These H800 numbers are inherited from the upstream Novita project; they are
+not HUST Ascend measurements. Configuration: Llama-3.1-8B, 8 prompts,
+10K-token prefill, 1-token decode, 4.0 req/s.
 
 | Configuration   | TTFT mean (ms) | TTFT p99 (ms) |
 | --------------- | -------------- | ------------- |
 | PegaFlow (Cold) | 572.5          | 1113.7        |
 | PegaFlow (Warm) | 61.5           | 77.0          |
 
-The warm-start path achieves **~9x faster TTFT** compared to cold-start, demonstrating effective KV cache sharing across requests.
+In that upstream CUDA benchmark, the warm-start path achieves **~9x faster
+TTFT** compared with cold-start.
+
+### HUST Ascend Evidence Status
+
+The checked-in `results/perf-*` and `results/trace-audit` artifacts cover the
+current single-node Ascend evaluation path. They do not establish a formal
+cross-node RDMA or SSD-cache result, nor a CUDA-versus-Ascend comparison.
+Treat the RDMA, SSD, and multi-node documentation below as implementation and
+configuration scope until matching HUST experiment artifacts are published.
 
 ## Documentation
 
