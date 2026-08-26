@@ -69,6 +69,7 @@ def main():
             requests_per_phase=3,
             warmup_first=True,
             prompt_fn=prompt_fn,
+            reproduce_args=["--lengths", str(target)],
             extra_metrics=[("total_s", "Total latency (full response)")],
         )
         print(f"\n{'='*70}\nT4 length: {target // 1000}k tokens\n{'='*70}")

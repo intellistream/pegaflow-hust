@@ -138,6 +138,7 @@ def main():
             requests_per_phase=1,   # only Q0 matters for hit rate
             warmup_first=True,
             prompt_fn=prompt_fn,
+            reproduce_args=["--ratios", str(ratio)],
             extra_gates=[("hitrate", _hitrate_gate(ratio))],
             extra_metrics=[("total_s", "Total latency (full response)")],
         )

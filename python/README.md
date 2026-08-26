@@ -12,22 +12,21 @@ High-performance key-value storage engine with Python bindings, built with Rust 
 ### From Source
 
 ```bash
-# Install maturin if you haven't already
-pip install maturin
-
-# Build and install in development mode
+# CUDA 12 (upstream-compatible default)
 cd python
-maturin develop
+uv run maturin develop --release
 
-# Or build a wheel
-maturin build --release
+# HUST Ascend
+uv run maturin develop --release --no-default-features --features ascend
 ```
 
-### From PyPI (coming soon)
+The package metadata in this branch uses the name `pegaflow-llm-npu`. It is
+not currently published to PyPI, so `pip install pegaflow` and
+`pip install pegaflow-llm-npu` are not supported installation paths.
 
-```bash
-pip install pegaflow
-```
+The separately maintained upstream CUDA distributions are
+[`pegaflow-llm`](https://pypi.org/project/pegaflow-llm/) and
+`pegaflow-llm-cu13`.
 
 ## Usage
 
@@ -125,17 +124,18 @@ The test suite includes integration tests that verify the `EngineRpcClient` can 
 
    ```bash
    cd python
-   maturin develop --release
+   uv run maturin develop --release
    ```
 
 2. **Build the server binary**:
 
    ```bash
    cd ..
-   cargo build --release --bin pegaflow-server
+   cargo build --release -p pegaflow-server --bin pegaflow-server
    ```
 
-3. **Ensure CUDA is available** (tests require GPU):
+3. **Ensure the selected accelerator is available** (integration tests require
+   hardware). For the default CUDA build:
    ```bash
    python -c "import torch; assert torch.cuda.is_available()"
    ```

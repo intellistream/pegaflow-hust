@@ -2,8 +2,8 @@
 """
 run_perf_base.py — shared harness for PegaFlow NPU performance experiments.
 
-Extracted from `run_trace_audit.py` (2026-08-18) to serve the perf test plan
-(`/workspace/HUST/pegaflow-perf-test-plan.md`). Methodology is identical to
+Extracted from `run_trace_audit.py` (2026-08-18) to serve the HUST performance
+test plan. Methodology is identical to
 the validated trace audit: matched arms, AB/BA alternation, independent
 server lifecycle per arm, fail-close evidence gates, preregistered
 per-query-class analysis.
@@ -14,7 +14,9 @@ applies to all.
 
 CLI (added by runners, base args are shared):
   --cycles N --requests-per-phase N --pool-size X --min-free-gb N
-  --num-instances N --model PATH --dry-run --verify-repro --out DIR
+  --num-instances N --model PATH --project-root DIR --vllm-root DIR
+  --ascend-root DIR --conda-root DIR --conda-env NAME
+  --dry-run --verify-repro --out DIR
 
 `--dry-run` synthesizes records and exercises the full merge/summary/gate
 pipeline without hardware (host-only gate). `--verify-repro` runs the
@@ -23,7 +25,7 @@ experiment twice and fails if verdicts differ (preregistered §9.1).
 
 from __future__ import annotations
 
-import argparse, hashlib, json, os, random, re, signal, subprocess, sys
+import argparse, hashlib, json, os, random, re, shlex, signal, subprocess, sys
 import threading, time, urllib.request, urllib.error, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -34,9 +36,19 @@ from pathlib import Path
 # Environment defaults (overridable via Experiment / CLI)
 # ---------------------------------------------------------------------------
 
-DEFAULT_PROJECT_ROOT = Path("/workspace/HUST/pegaflow-hust")
-DEFAULT_VLLM_ROOT = Path("/workspace/HUST/vllm-hust")
-DEFAULT_MODEL = "/workspace/HUST/models/Qwen3-8B"
+DEFAULT_PROJECT_ROOT = Path(os.environ.get(
+    "PEGAFLOW_PROJECT_ROOT", Path(__file__).resolve().parents[1]
+)).expanduser()
+DEFAULT_VLLM_ROOT = Path(os.environ.get(
+    "PEGAFLOW_VLLM_ROOT", DEFAULT_PROJECT_ROOT.parent / "vllm-hust"
+)).expanduser()
+DEFAULT_ASCEND_ROOT = Path(os.environ.get(
+    "PEGAFLOW_ASCEND_ROOT", DEFAULT_PROJECT_ROOT.parent / "vllm-ascend-hust"
+)).expanduser()
+DEFAULT_MODEL = os.environ.get(
+    "PEGAFLOW_MODEL", str(DEFAULT_PROJECT_ROOT.parent / "models" / "Qwen3-8B")
+)
+DEFAULT_CONDA_ROOT = Path(os.environ.get("CONDA_ROOT", "/root/miniconda3"))
 DEFAULT_SERVER_PORT = 50080
 DEFAULT_VLLM_BASE_PORT = 19000
 DEFAULT_CONDA_ENV = "vllm-hust-dev"
@@ -142,6 +154,9 @@ class Experiment:
     gmu: float | None = None
     # Custom negative examples (defaults inherited if None)
     negative_examples: dict | None = None
+    # Runner-specific selector needed to reproduce a sweep point, for example
+    # ["--ratios", "50"] for T3. Common harness arguments are added below.
+    reproduce_args: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +164,8 @@ class Experiment:
 # ---------------------------------------------------------------------------
 
 def capture_environment(project_root: Path, vllm_root: Path,
-                        model_path: str) -> dict:
+                        ascend_root: Path, model_path: str,
+                        conda_root: Path, conda_env: str) -> dict:
     """Record everything needed to reproduce this run."""
     info: dict = {}
     for _cmd, _key in [
@@ -160,19 +176,21 @@ def capture_environment(project_root: Path, vllm_root: Path,
         try:
             info[_key] = subprocess.check_output(
                 ["git", "-C", str(project_root)] + _cmd, timeout=10,
+                stderr=subprocess.DEVNULL,
             ).decode().strip()
         except Exception:
             info[_key] = "unknown"
     try:
         info["runtime_commit_vllm"] = subprocess.check_output(
             ["git", "-C", str(vllm_root), "rev-parse", "HEAD"], timeout=10,
+            stderr=subprocess.DEVNULL,
         ).decode().strip()
     except Exception:
         info["runtime_commit_vllm"] = "unknown"
     try:
         info["runtime_commit_ascend"] = subprocess.check_output(
-            ["git", "-C", str(Path("/workspace/HUST/vllm-ascend-hust")),
-             "rev-parse", "HEAD"], timeout=10,
+            ["git", "-C", str(ascend_root), "rev-parse", "HEAD"], timeout=10,
+            stderr=subprocess.DEVNULL,
         ).decode().strip()
     except Exception:
         info["runtime_commit_ascend"] = "unknown"
@@ -193,8 +211,7 @@ def capture_environment(project_root: Path, vllm_root: Path,
 
     # Torch version probe must run in the conda runtime env (bare python3 has
     # no torch on this host).
-    conda_py = Path(os.environ.get("CONDA_ROOT", "/root/miniconda3")) / \
-        "envs" / DEFAULT_CONDA_ENV / "bin" / "python"
+    conda_py = conda_root / "envs" / conda_env / "bin" / "python"
     try:
         info["torch_version"] = subprocess.check_output(
             [str(conda_py), "-c",
@@ -1567,12 +1584,52 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-free-gb", type=int, default=28)
     parser.add_argument("--num-instances", type=int, default=8)
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    parser.add_argument("--project-root", type=str,
+                        default=str(DEFAULT_PROJECT_ROOT))
+    parser.add_argument("--vllm-root", type=str,
+                        default=str(DEFAULT_VLLM_ROOT))
+    parser.add_argument("--ascend-root", type=str,
+                        default=str(DEFAULT_ASCEND_ROOT))
+    parser.add_argument("--conda-root", type=str,
+                        default=str(DEFAULT_CONDA_ROOT))
+    parser.add_argument("--conda-env", type=str, default=DEFAULT_CONDA_ENV)
     parser.add_argument("--dry-run", action="store_true",
                         help="Host-only: synthesize records, run full gate pipeline")
     parser.add_argument("--verify-repro", action="store_true",
                         help="Run twice; fail if verdicts differ (§9.1)")
     parser.add_argument("--out", type=str, default=None,
                         help="Override results root (default results/perf-{id}/)")
+
+
+def build_reproduce_command(experiment: Experiment, args,
+                            project_root: Path, vllm_root: Path,
+                            ascend_root: Path, conda_root: Path,
+                            conda_env: str,
+                            runner_path: Path | None = None) -> str:
+    """Build a runnable command for this exact experiment or sweep point."""
+    runner = (runner_path or Path(sys.argv[0])).resolve()
+    try:
+        runner_arg = str(runner.relative_to(project_root.resolve()))
+    except ValueError:
+        runner_arg = str(runner)
+
+    command = ["python3", runner_arg, *experiment.reproduce_args,
+               "--cycles", str(args.cycles),
+               "--requests-per-phase", str(args.requests_per_phase),
+               "--pool-size", args.pool_size,
+               "--min-free-gb", str(args.min_free_gb),
+               "--num-instances", str(args.num_instances),
+               "--model", args.model,
+               "--project-root", str(project_root),
+               "--vllm-root", str(vllm_root),
+               "--ascend-root", str(ascend_root),
+               "--conda-root", str(conda_root),
+               "--conda-env", conda_env]
+    if args.verify_repro:
+        command.append("--verify-repro")
+    if args.out:
+        command.extend(["--out", args.out])
+    return shlex.join(command)
 
 
 def run_experiment(experiment: Experiment, argv: list[str] | None = None,
@@ -1590,11 +1647,12 @@ def run_experiment(experiment: Experiment, argv: list[str] | None = None,
     )
     args = parser.parse_args(argv)
 
-    project_root = DEFAULT_PROJECT_ROOT
-    vllm_root = DEFAULT_VLLM_ROOT
+    project_root = Path(args.project_root).expanduser().resolve()
+    vllm_root = Path(args.vllm_root).expanduser().resolve()
+    ascend_root = Path(args.ascend_root).expanduser().resolve()
     model_path = args.model or experiment.model
-    conda_root = Path(os.environ.get("CONDA_ROOT", "/root/miniconda3"))
-    conda_env = DEFAULT_CONDA_ENV
+    conda_root = Path(args.conda_root).expanduser().resolve()
+    conda_env = args.conda_env
     server_port = DEFAULT_SERVER_PORT
     vllm_base_port = DEFAULT_VLLM_BASE_PORT
     log_level = os.environ.get("PEGAFLOW_SERVER_LOG_LEVEL", "info")
@@ -1606,15 +1664,13 @@ def run_experiment(experiment: Experiment, argv: list[str] | None = None,
     log_dir = out_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    env_info = capture_environment(project_root, vllm_root, model_path)
+    env_info = capture_environment(project_root, vllm_root, ascend_root,
+                                   model_path, conda_root, conda_env)
     env_info["run_id"] = run_id
     env_info["experiment"] = experiment.id
-    reproduce = (f"python scripts/run_perf_{experiment.id}_baseline.py "
-                 f"--cycles {args.cycles} --requests-per-phase {args.requests_per_phase} "
-                 f"--pool-size {args.pool_size} --num-instances {args.num_instances}")
-    if args.verify_repro:
-        reproduce += " --verify-repro"
-    env_info["reproduce_command"] = reproduce
+    env_info["reproduce_command"] = build_reproduce_command(
+        experiment, args, project_root, vllm_root, ascend_root,
+        conda_root, conda_env)
 
     print("=" * 70)
     print(f"  {experiment.title}")
@@ -1637,7 +1693,8 @@ def run_experiment(experiment: Experiment, argv: list[str] | None = None,
     if args.verify_repro:
         print("\n[verify-repro] running second pass...")
         time.sleep(10)
-        env_info2 = capture_environment(project_root, vllm_root, model_path)
+        env_info2 = capture_environment(project_root, vllm_root, ascend_root,
+                                        model_path, conda_root, conda_env)
         run_hardware_pipeline(experiment, args, env_info2, out_dir, log_dir,
                               project_root, vllm_root, model_path,
                               conda_root, conda_env, server_port,

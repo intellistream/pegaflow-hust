@@ -65,6 +65,9 @@ def main():
             concurrency=concurrency,
             batch_interval_s=interval_s,
             warmup_first=True,
+            reproduce_args=[
+                "--combos", f"{concurrency}:{int(interval_s * 1000)}"
+            ],
             extra_metrics=[("total_s", "Total latency (full response)")],
         )
         print(f"\n{'='*70}\nT2 combo: concurrency={concurrency} "
