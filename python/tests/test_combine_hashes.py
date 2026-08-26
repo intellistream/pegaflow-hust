@@ -612,7 +612,8 @@ class TestSchedulerQueryProbeReuse:
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
-        with pytest.raises(RuntimeError, match="load block mismatch"):
+        # Error message moved to the earlier lease-count check (span-aware load).
+        with pytest.raises(RuntimeError, match="leased block mismatch"):
             sc.update_state_after_alloc(req, blocks, num_external_tokens=16)
 
         engine_client.release.assert_called_once_with(b"lease-1")

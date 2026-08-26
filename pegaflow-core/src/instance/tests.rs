@@ -100,11 +100,10 @@ fn single_worker_registration_seals_topology() {
     // Names intentionally out of registration order: ids come from sorted
     // names, not from declaration order.
     instance
-        .register_new_gpu(gpu_registration(
-            0,
-            0,
-            &["layer_b", "layer_a", "layer_d", "layer_c"],
-        ), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration(0, 0, &["layer_b", "layer_a", "layer_d", "layer_c"]),
+            test_gpu_pool(0),
+        )
         .expect("register gpu with layers");
 
     let topology = instance
@@ -148,12 +147,10 @@ fn page_first_collapses_slots_and_lays_out_page() {
     // segment_bytes=1024, single segment, no SSD padding on this path, so each
     // layer's padded_block_bytes == 1024.
     instance
-        .register_new_gpu(gpu_registration_with_segment_bytes(
-            0,
-            0,
-            &["layer_b", "layer_a", "layer_c"],
-            1024,
-        ), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration_with_segment_bytes(0, 0, &["layer_b", "layer_a", "layer_c"], 1024),
+            test_gpu_pool(0),
+        )
         .expect("register page-first gpu");
 
     let topology = instance.sealed_topology().expect("sealed");
@@ -250,20 +247,16 @@ fn page_first_layer_split_seals_per_shard_slots() {
     let instance =
         InstanceContext::new("split-page".into(), "split-ns".into(), 1, 2, true).unwrap();
     instance
-        .register_new_gpu(gpu_registration_with_segment_bytes(
-            0,
-            0,
-            &["layer_a", "layer_c"],
-            1024,
-        ), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration_with_segment_bytes(0, 0, &["layer_a", "layer_c"], 1024),
+            test_gpu_pool(0),
+        )
         .expect("rank 0 registers its shard");
     instance
-        .register_new_gpu(gpu_registration_with_segment_bytes(
-            1,
-            0,
-            &["layer_b"],
-            1024,
-        ), test_gpu_pool(1))
+        .register_new_gpu(
+            gpu_registration_with_segment_bytes(1, 0, &["layer_b"], 1024),
+            test_gpu_pool(1),
+        )
         .expect("rank 1 registers its shard, sealing the instance");
 
     let topology = instance.sealed_topology().expect("sealed");
@@ -345,20 +338,26 @@ fn seal_derives_layer_space_from_union_of_workers() {
 
     let instance = InstanceContext::new("pp-mtp".into(), "pp-mtp-ns".into(), 1, 2, false).unwrap();
     instance
-        .register_new_gpu(gpu_registration(0, 0, &["model.layers.0.self_attn.attn"]), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration(0, 0, &["model.layers.0.self_attn.attn"]),
+            test_gpu_pool(0),
+        )
         .expect("stage 0 registers the main layer");
     instance
-        .register_new_gpu(GpuRegistration {
-            pp_rank: 1,
-            ..gpu_registration(
-                1,
-                0,
-                &[
-                    "model.layers.1.self_attn.attn",
-                    "model.layers.2.self_attn.attn", // speculative MTP layer
-                ],
-            )
-        }, test_gpu_pool(1))
+        .register_new_gpu(
+            GpuRegistration {
+                pp_rank: 1,
+                ..gpu_registration(
+                    1,
+                    0,
+                    &[
+                        "model.layers.1.self_attn.attn",
+                        "model.layers.2.self_attn.attn", // speculative MTP layer
+                    ],
+                )
+            },
+            test_gpu_pool(1),
+        )
         .expect("stage 1 registers main + MTP layers");
 
     let topology = instance.sealed_topology().expect("sealed");
@@ -422,10 +421,13 @@ fn seal_rejects_replicas_across_pipeline_stages() {
         .expect("register pp_rank 0 owner");
 
     let err = instance
-        .register_new_gpu(GpuRegistration {
-            pp_rank: 1,
-            ..gpu_registration(1, 0, layers)
-        }, test_gpu_pool(1))
+        .register_new_gpu(
+            GpuRegistration {
+                pp_rank: 1,
+                ..gpu_registration(1, 0, layers)
+            },
+            test_gpu_pool(1),
+        )
         .expect_err("one layer on two pipeline stages must be rejected at seal");
     assert!(err.to_string().contains("different pipeline stages"));
 
@@ -448,7 +450,10 @@ fn seal_rejects_missing_slot_owner() {
     let instance =
         InstanceContext::new("missing-slot".into(), "missing-ns".into(), 2, 2, false).unwrap();
     instance
-        .register_new_gpu(gpu_registration(0, 0, &["layer_0", "layer_1"]), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration(0, 0, &["layer_0", "layer_1"]),
+            test_gpu_pool(0),
+        )
         .expect("rank 0 registers both layers");
 
     let err = instance
@@ -459,7 +464,10 @@ fn seal_rejects_missing_slot_owner() {
 
     // Re-registering rank 1 with the full layer set seals the instance.
     instance
-        .register_new_gpu(gpu_registration(1, 1, &["layer_0", "layer_1"]), test_gpu_pool(1))
+        .register_new_gpu(
+            gpu_registration(1, 1, &["layer_0", "layer_1"]),
+            test_gpu_pool(1),
+        )
         .expect("complete worker set seals");
     assert!(instance.sealed_topology().is_ok());
 }
@@ -475,21 +483,17 @@ fn seal_rejects_inconsistent_layer_geometry() {
 
     let instance = InstanceContext::new("geom".into(), "geom-ns".into(), 1, 2, false).unwrap();
     instance
-        .register_new_gpu(gpu_registration_with_segment_bytes(
-            0,
-            0,
-            &["layer_0"],
-            1024,
-        ), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration_with_segment_bytes(0, 0, &["layer_0"], 1024),
+            test_gpu_pool(0),
+        )
         .expect("register first replica");
 
     let err = instance
-        .register_new_gpu(gpu_registration_with_segment_bytes(
-            1,
-            0,
-            &["layer_0"],
-            2048,
-        ), test_gpu_pool(1))
+        .register_new_gpu(
+            gpu_registration_with_segment_bytes(1, 0, &["layer_0"], 2048),
+            test_gpu_pool(1),
+        )
         .expect_err("same name with different geometry must fail the seal");
     assert!(err.to_string().contains("inconsistent geometry"));
 }
@@ -505,16 +509,19 @@ fn hybrid_topology_seals_per_group_slot_spaces() {
     // totals are what distinguish groups (tp_rank math is unchanged).
     let instance = InstanceContext::new("hybrid".into(), "hybrid-ns".into(), 1, 1, false).unwrap();
     instance
-        .register_new_gpu(gpu_registration_with_groups(
-            0,
-            0,
-            &[
-                ("attn_a", 0),
-                ("attn_b", 0),
-                ("recurrent_c", 1),
-                ("recurrent_d", 1),
-            ],
-        ), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration_with_groups(
+                0,
+                0,
+                &[
+                    ("attn_a", 0),
+                    ("attn_b", 0),
+                    ("recurrent_c", 1),
+                    ("recurrent_d", 1),
+                ],
+            ),
+            test_gpu_pool(0),
+        )
         .expect("register hybrid gpu");
 
     let topology = instance.sealed_topology().expect("sealed");
@@ -548,7 +555,10 @@ fn default_groups_keep_global_slot_layout() {
     let instance =
         InstanceContext::new("classic".into(), "classic-ns".into(), 1, 1, false).unwrap();
     instance
-        .register_new_gpu(gpu_registration(0, 0, &["layer_a", "layer_b", "layer_c"]), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration(0, 0, &["layer_a", "layer_b", "layer_c"]),
+            test_gpu_pool(0),
+        )
         .expect("register classic gpu");
 
     let topology = instance.sealed_topology().expect("sealed");
@@ -576,11 +586,17 @@ fn seal_rejects_inconsistent_layer_group_across_devices() {
     let instance =
         InstanceContext::new("grp-conflict".into(), "grp-ns".into(), 1, 2, false).unwrap();
     instance
-        .register_new_gpu(gpu_registration_with_groups(0, 0, &[("layer_0", 0)]), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration_with_groups(0, 0, &[("layer_0", 0)]),
+            test_gpu_pool(0),
+        )
         .expect("first worker");
 
     let err = instance
-        .register_new_gpu(gpu_registration_with_groups(1, 0, &[("layer_0", 1)]), test_gpu_pool(1))
+        .register_new_gpu(
+            gpu_registration_with_groups(1, 0, &[("layer_0", 1)]),
+            test_gpu_pool(1),
+        )
         .expect_err("same layer in different groups must fail the seal");
     assert!(err.to_string().contains("storage group"), "{err}");
 }
@@ -592,11 +608,10 @@ fn seal_rejects_inconsistent_layer_group_across_devices() {
 fn seal_rejects_sparse_group_ids() {
     let instance = InstanceContext::new("sparse".into(), "sparse-ns".into(), 1, 1, false).unwrap();
     let err = instance
-        .register_new_gpu(gpu_registration_with_groups(
-            0,
-            0,
-            &[("layer_a", 0), ("layer_b", 2)],
-        ), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration_with_groups(0, 0, &[("layer_a", 0), ("layer_b", 2)]),
+            test_gpu_pool(0),
+        )
         .expect_err("group 1 with no layers must fail the seal");
     assert!(err.to_string().contains("dense"), "{err}");
 }
@@ -609,11 +624,10 @@ fn page_first_rejects_multiple_groups() {
     let instance =
         InstanceContext::new("page-hybrid".into(), "page-hybrid-ns".into(), 1, 1, true).unwrap();
     let err = instance
-        .register_new_gpu(gpu_registration_with_groups(
-            0,
-            0,
-            &[("layer_a", 0), ("layer_b", 1)],
-        ), test_gpu_pool(0))
+        .register_new_gpu(
+            gpu_registration_with_groups(0, 0, &[("layer_a", 0), ("layer_b", 1)]),
+            test_gpu_pool(0),
+        )
         .expect_err("page-first with two storage groups must be rejected");
     assert!(err.to_string().contains("page-first"), "{err}");
 }

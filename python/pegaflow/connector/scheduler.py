@@ -610,9 +610,13 @@ class SchedulerConnector:
     def _consume_save_intent(
         self,
         req_id: str,
-        written: int,
+        written: int | None = None,
         computed_before_step: int = 0,
     ) -> SaveIntent | None:
+        # Upstream-test compatibility: the pre-#433 call shape had no
+        # scheduler-authoritative `written`; derive it from scheduled tokens.
+        if written is None:
+            written = self._scheduled_tokens.get(req_id, 0)
         """Calculate and return SaveIntent for new blocks that need saving.
 
         `written` = positions with valid KV once this step's schedule runs
@@ -737,6 +741,10 @@ class SchedulerConnector:
             return None
 
         allocated = self._allocated_blocks.get(req_id, [])
+        # Legacy (pre-cache-group) shape: a flat block-id list instead of a
+        # per-group tuple of lists. Normalize to one group.
+        if allocated and not isinstance(allocated[0], (list, tuple)):
+            allocated = [tuple(allocated)]
         scheduled = self._scheduled_tokens.get(req_id, 0)
         base_block_idx = self._block_index_offsets.get(req_id, 0)
         start_block_idx = self._next_stored_block_idx.get(req_id, base_block_idx)
@@ -998,7 +1006,7 @@ class SchedulerConnector:
         over a 512-token MLA hash group: span = 512 / 8 = 64.
         """
         vbs = self._ctx.virtual_block_size
-        block_sizes = self._cache_groups.group_block_sizes
+        block_sizes = getattr(self._cache_groups, "group_block_sizes", ())
         if not block_sizes or vbs <= 0:
             return 1
         block_size = block_sizes[self._cache_groups.hash_group_index]

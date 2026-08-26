@@ -475,31 +475,49 @@ class NoopKVConnector(KVConnectorBase_V1, SupportsHMA):
 
 
 def _resolve_device_id() -> int:
-    """
-    Return the global CUDA device id even when CUDA_VISIBLE_DEVICES masks GPUs.
+    """Return the global device id even when visibility env vars mask devices.
 
-    torch.cuda.current_device() returns the local index within the visible set,
-    but we need the actual global device ID for operations like CUDA IPC.
-    This function maps the local index back to the global device ID.
+    Handles CUDA_VISIBLE_DEVICES and ASCEND_RT_VISIBLE_DEVICES.  Falls back
+    to local index when no visibility masking is active.  Checks CUDA first,
+    then Ascend NPU, then returns 0 as a safe default.
+
+    Set PEGAFLOW_DEVICE_ID to an integer to bypass auto-detection entirely
+    (useful when both server and client share the same visibility mask via
+    ASCEND_RT_VISIBLE_DEVICES and the connector should report the local index).
     """
-    local_id = torch.cuda.current_device()
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    override = os.environ.get("PEGAFLOW_DEVICE_ID")
+    if override is not None:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+
+    if torch.cuda.is_available():
+        local_id = torch.cuda.current_device()
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        return _map_device(local_id, visible)
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        local_id = torch.npu.current_device()
+        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+        return _map_device(local_id, visible)
+    return 0
+
+
+def _map_device(local_id: int, visible: str | None) -> int:
     if not visible:
         return local_id
-
     slots = [slot.strip() for slot in visible.split(",") if slot.strip()]
     try:
         mapped = slots[local_id]
     except IndexError:
         return local_id
-
     try:
         return int(mapped)
     except ValueError:
         return local_id
 
 
-__all__ = ["PegaKVConnector", "NoopKVConnector", "KVConnectorRole"]
+
 
 
 def _resolve_npu_device_id() -> int:

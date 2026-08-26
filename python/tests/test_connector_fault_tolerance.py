@@ -270,7 +270,8 @@ def test_load_uses_registered_layer_names_before_forward_context_names():
     worker.start_load_kv(_load_metadata("req_registered_layers", (1, 2)), forward_context)
 
     assert len(client.load_calls) == 1
-    assert client.load_calls[0][4] == ["registered.layer.0", "registered.layer.1"]
+    # load 契约改为 per-group layer lists (layer_groups)
+    assert client.load_calls[0][4] == [["registered.layer.0", "registered.layer.1"]]
 
     worker.shutdown()
 

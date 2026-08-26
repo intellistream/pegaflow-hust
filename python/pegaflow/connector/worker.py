@@ -166,7 +166,6 @@ def _registration_tensor(kv_cache) -> torch.Tensor:
     # recurrent states; the storage-offset/shared-storage invariants below are
     # Mamba-specific. NpuIPCWrapper preserves storage_offset, so we relax the
     # checks and pass the first element through (T6).
-    storage_ptr = first.untyped_storage().data_ptr()
     num_blocks = first.shape[0]
     page_bytes = first.stride(0) * first.element_size()
     for state in states:
@@ -912,13 +911,17 @@ class WorkerConnector:
                             f"save block/hash count mismatch for {layer_name}: "
                             f"blocks={len(block_ids)} hashes={len(block_hashes)}"
                         )
-                    non_null = tuple(
-                        (block_id, block_hash)
-                        for block_id, block_hash in zip(block_ids, block_hashes, strict=True)
-                        if block_id != 0
-                    )
-                    block_ids = tuple(block_id for block_id, _ in non_null)
-                    block_hashes = tuple(block_hash for _, block_hash in non_null)
+                    # vLLM's null-block sentinel (0) only exists in hybrid
+                    # (HMA) cache layouts; single-group deployments use block 0
+                    # as a real block id, so filter only for multi-group.
+                    if self._cache_groups.group_count > 1:
+                        non_null = tuple(
+                            (block_id, block_hash)
+                            for block_id, block_hash in zip(block_ids, block_hashes, strict=True)
+                            if block_id != 0
+                        )
+                        block_ids = tuple(block_id for block_id, _ in non_null)
+                        block_hashes = tuple(block_hash for _, block_hash in non_null)
                     if self._page_first and not self._use_mla_layer_split_registration:
                         # Full-replica (one shard): every rank holds all layers,
                         # so spread the whole-page writes across ranks by block
@@ -936,7 +939,7 @@ class WorkerConnector:
         if saves_by_layer:
             # Ensure all GPU kernels have completed before reading KV cache
             # Otherwise we may copy uninitialized memory (attention kernel is async)
-            if self._torch_device.type == "npu":
+            if self._torch_device is not None and self._torch_device.type == "npu":
                 torch.npu.synchronize(self._torch_device)
             else:
                 torch.cuda.synchronize(self._torch_device)
@@ -1036,8 +1039,12 @@ class WorkerConnector:
     def _block_shard(
         self,
         block_ids: Iterable[int],
-        block_hashes: Iterable[bytes],
+        block_hashes: Iterable[bytes] | None = None,
     ) -> tuple[list[int], list[bytes]]:
+        if block_hashes is None:
+            # Legacy call shape: a SaveIntent (pre-cache-group).
+            intent = block_ids
+            block_ids, block_hashes = intent.block_ids, intent.block_hashes
         """`(block_ids, hashes)` this rank saves under page-first: a block stripe.
 
         A page needs all layers, so page-first distributes save work by block
