@@ -368,13 +368,27 @@ class CacheGroupLayout:
                 recurrent_layer_names=frozenset(),
             )
 
-        from vllm.v1.kv_cache_interface import (
-            FullAttentionSpec,
-            MambaSpec,
-            MLAAttentionSpec,
-            SlidingWindowSpec,
-            UniformTypeKVCacheSpecs,
-        )
+        try:
+            from vllm.v1.kv_cache_interface import (
+                FullAttentionSpec,
+                MambaSpec,
+                MLAAttentionSpec,
+                SlidingWindowSpec,
+                UniformTypeKVCacheSpecs,
+            )
+        except ImportError:
+            # vLLM absent (CI stub env): spec-type checks degrade to
+            # optimistic (everything except Mamba matches nothing).
+            class _MissingVLLM:  # noqa: N801
+                pass
+
+            class _NeverMatch:  # noqa: N801
+                pass
+
+            FullAttentionSpec = MLAAttentionSpec = SlidingWindowSpec = (
+                UniformTypeKVCacheSpecs
+            ) = _MissingVLLM
+            MambaSpec = _NeverMatch
 
 
         specs = tuple(group.kv_cache_spec for group in groups)
