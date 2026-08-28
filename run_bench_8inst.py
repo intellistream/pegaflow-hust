@@ -29,10 +29,13 @@ Usage
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import platform
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -46,7 +49,8 @@ from pathlib import Path
 # Config
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path("/workspace/HUST/pegaflow-hust")
-LOG_DIR = Path("/tmp/pegaflow-bench-8inst")
+LOG_ROOT = Path("/tmp/pegaflow-bench-8inst")
+LOG_DIR = LOG_ROOT / "not-started"
 
 MODEL_PATH = "/workspace/HUST/models/Qwen3-8B"
 MODEL_FALLBACK = "/workspace/HUST/models/Qwen2.5-7B-Instruct"
@@ -56,6 +60,8 @@ VLLM_BASE_PORT = 18700
 SHARED_NS = "bench-8inst-shared"
 ISOLATED_NS_PREFIX = "bench-8inst-iso"
 NUM_INSTANCES = 8
+_OWNED_PROCESSES: set[subprocess.Popen] = set()
+_OWNED_PROCESSES_LOCK = threading.Lock()
 
 _SYS_BLOCK = (
     "You are an expert AI assistant with deep knowledge across many domains including "
@@ -169,16 +175,85 @@ def get_npu_free_memory() -> dict[int, int]:
 
 
 # =========================================================================
-# Process helpers
+# Preflight and process helpers
 # =========================================================================
 
-def kill_all() -> None:
-    for p in ["pegaflow-server", "vllm serve"]:
-        os.system(f"pkill -f '{p}' 2>/dev/null || true")
+
+def _git_head(path: Path) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _port_is_free(port: int) -> bool:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def run_preflight(model_path: str, min_free_mb: int) -> dict:
+    """Return auditable readiness evidence without starting or killing jobs."""
+    binary = PROJECT_ROOT / "target" / "debug" / "pegaflow-server"
+    ports = [SERVER_PORT, 9091, *range(VLLM_BASE_PORT, VLLM_BASE_PORT + 8)]
+    free_memory = get_npu_free_memory()
+    import_probe = subprocess.run(
+        [
+            "bash",
+            "-lc",
+            "source /root/miniconda3/etc/profile.d/conda.sh && "
+            "conda activate vllm-hust-dev && "
+            "python -c 'import torch, torch_npu, vllm, pegaflow'",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    checks = {
+        "runtime_imports": import_probe.returncode == 0,
+        "model_directory": Path(model_path).is_dir(),
+        "model_config": (Path(model_path) / "config.json").is_file(),
+        "pegaflow_server_binary": binary.is_file() and os.access(binary, os.X_OK),
+        "ports_free": all(_port_is_free(port) for port in ports),
+        "eight_npus_ready": all(
+            free_memory.get(index, -1) >= min_free_mb for index in range(8)
+        ),
+        "output_directory_new": not LOG_DIR.exists(),
+    }
+    return {
+        "provenance_label": "preflight-only",
+        "ready_for_real_online": all(checks.values()),
+        "checks": checks,
+        "git_commit": _git_head(PROJECT_ROOT),
+        "command": sys.argv,
+        "python": sys.executable,
+        "platform": platform.platform(),
+        "model_path": model_path,
+        "server_ports": ports,
+        "npu_free_hbm_mb": free_memory,
+        "minimum_free_hbm_mb": min_free_mb,
+        "runtime_import_probe_stderr": import_probe.stderr[-2000:],
+    }
 
 
 def stop_proc(proc: subprocess.Popen | None) -> None:
-    if proc is None or proc.poll() is not None:
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        with _OWNED_PROCESSES_LOCK:
+            _OWNED_PROCESSES.discard(proc)
         return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -188,13 +263,32 @@ def stop_proc(proc: subprocess.Popen | None) -> None:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:
             pass
+    finally:
+        with _OWNED_PROCESSES_LOCK:
+            _OWNED_PROCESSES.discard(proc)
+
+
+def _track_proc(proc: subprocess.Popen) -> subprocess.Popen:
+    with _OWNED_PROCESSES_LOCK:
+        _OWNED_PROCESSES.add(proc)
+    return proc
+
+
+def _stop_owned_processes() -> None:
+    with _OWNED_PROCESSES_LOCK:
+        processes = tuple(_OWNED_PROCESSES)
+    for proc in processes:
+        stop_proc(proc)
+
+
+atexit.register(_stop_owned_processes)
 
 
 def start_server(free_npus: list[int], pool_size: str) -> subprocess.Popen:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = LOG_DIR / "server.log"
     devices = ",".join(str(i) for i in free_npus)
-    proc = subprocess.Popen(
+    proc = _track_proc(subprocess.Popen(
         [
             str(PROJECT_ROOT / "target" / "debug" / "pegaflow-server"),
             "--addr", f"0.0.0.0:{SERVER_PORT}",
@@ -203,7 +297,7 @@ def start_server(free_npus: list[int], pool_size: str) -> subprocess.Popen:
         ],
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
-    )
+    ))
     deadline = time.time() + 30
     while time.time() < deadline:
         time.sleep(1)
@@ -212,7 +306,10 @@ def start_server(free_npus: list[int], pool_size: str) -> subprocess.Popen:
                 return proc
         except Exception:
             pass
-    raise RuntimeError(f"Server failed. Log: {log.read_text()[-300:] if log.exists() else 'N/A'}")
+    stop_proc(proc)
+    raise RuntimeError(
+        f"Server failed. Log: {log.read_text()[-300:] if log.exists() else 'N/A'}"
+    )
 
 
 def start_vllm(
@@ -249,11 +346,11 @@ def start_vllm(
         })
         cmd_parts.append(f"--kv-transfer-config '{kv_cfg}'")
     cmd = " && ".join([cmd_parts[0] + " && " + cmd_parts[1], " ".join(cmd_parts[2:])])
-    proc = subprocess.Popen(
+    proc = _track_proc(subprocess.Popen(
         ["bash", "-c", cmd], env=env,
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
-    )
+    ))
     deadline = time.time() + 180
     while time.time() < deadline:
         try:
@@ -261,6 +358,7 @@ def start_vllm(
             return proc
         except Exception:
             time.sleep(3)
+    stop_proc(proc)
     raise RuntimeError(
         f"vLLM {label} not healthy after 180s. "
         f"Log: {log.read_text()[-400:] if log.exists() else 'N/A'}"
@@ -636,6 +734,7 @@ def extract_hit_rate() -> float:
 # =========================================================================
 
 def main() -> None:
+    global LOG_DIR, PROJECT_ROOT
     parser = argparse.ArgumentParser(
         description="PegaFlow 8-Instance Shared Cache Benchmark"
     )
@@ -653,27 +752,67 @@ def main() -> None:
                         help="Use IDENTICAL prompts for all requests "
                         "(max cache hit rate, best PegaFlow demo)")
     parser.add_argument("--min-free-gb", type=int, default=28,
-                        help="Min free HBM per NPU before attempting startup (default: 20 GB)")
+                        help="Min free HBM per NPU before attempting startup (default: 28 GB)")
+    parser.add_argument(
+        "--model",
+        default=MODEL_PATH,
+        help="Exact local model directory used by every server",
+    )
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=PROJECT_ROOT,
+        help="PegaFlow checkout containing target/debug/pegaflow-server",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Fresh output directory; defaults to a timestamped directory",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Record readiness without launching or terminating any service",
+    )
     args = parser.parse_args()
 
     min_free_mb = args.min_free_gb * 1024
+    PROJECT_ROOT = args.project_root.expanduser().resolve()
+
+    if args.output_dir is None:
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        head = _git_head(PROJECT_ROOT) or "unknown"
+        LOG_DIR = LOG_ROOT / f"{stamp}-{head[:12]}"
+    else:
+        LOG_DIR = args.output_dir.expanduser().resolve()
+    if LOG_DIR.exists():
+        print(f"[ERROR] output directory already exists: {LOG_DIR}")
+        sys.exit(2)
 
     # ---- Validate model ----
-    model_path = MODEL_PATH
+    model_path = args.model
     if not Path(model_path).is_dir():
         print(f"[WARN] {model_path} not found, trying fallback...")
         if Path(MODEL_FALLBACK).is_dir():
             model_path = MODEL_FALLBACK
             print(f"  Using {model_path}")
         else:
-            print(f"  Download: python -c \"from modelscope import snapshot_download; "
-                  f"snapshot_download('Qwen/Qwen3-8B')\"")
-            sys.exit(1)
+            print("  No fallback found; preflight will record the missing model")
+
+    preflight = run_preflight(model_path, min_free_mb)
+    LOG_DIR.mkdir(parents=True, exist_ok=False)
+    (LOG_DIR / "preflight.json").write_text(
+        json.dumps(preflight, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(json.dumps(preflight, indent=2, sort_keys=True))
+    if args.preflight_only:
+        sys.exit(0 if preflight["ready_for_real_online"] else 2)
+    if not preflight["ready_for_real_online"]:
+        print("[ERROR] preflight failed; no service was launched")
+        sys.exit(2)
 
     num_requests = args.requests
     queries = USER_QUERIES[:num_requests]
-
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # ---- Build instance specs ----
     # Each instance gets NPU 0-7 (one per physical NPU)
@@ -698,9 +837,6 @@ def main() -> None:
     print(f"  Reqs:  {num_requests}/instance ({num_requests * NUM_INSTANCES} total)")
     print(f"  Prompt: ~{len(SYSTEM_PROMPT.split())} words")
     print("=" * 70)
-
-    kill_all()
-    time.sleep(2)
 
     print(f"\n[1/4] Starting pegaflow-server...")
     server = start_server(list(range(8)), args.pool_size)
@@ -833,6 +969,8 @@ def main() -> None:
         output = LOG_DIR / "results.json"
         with open(output, "w") as f:
             json.dump({
+                "provenance_label": "real-online",
+                "preflight": preflight,
                 "benchmark": "8inst_shared_vs_isolated",
                 "model": str(Path(model_path).name),
                 "instances": NUM_INSTANCES,
@@ -848,7 +986,6 @@ def main() -> None:
     finally:
         print(f"\n[4/4] Shutting down...")
         stop_proc(server)
-        kill_all()
 
     print("=" * 70)
     print("  Done.")
