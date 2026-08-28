@@ -7,7 +7,7 @@
   "lifecycle": "incubating",
   "artifacts": [
     {
-      "id": "pegaflow-system",
+      "id": "pegaflow",
       "artifact_type": "external_system",
       "system_role": "kv_state_manager",
       "delivery_model": "container_service",
