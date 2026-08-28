@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0",
+  "canonical_registry": "https://github.com/vLLM-HUST/vllm-hust-docs/tree/codex/ecosystem-architecture-reorganization/registry",
+  "repository": "https://github.com/vLLM-HUST/pegaflow-hust",
+  "repository_role": "external_subsystem",
+  "relation_to_runtime": "provides_external_subsystem",
+  "lifecycle": "incubating",
+  "artifacts": [
+    {
+      "id": "pegaflow-system",
+      "artifact_type": "external_system",
+      "system_role": "kv_state_manager",
+      "delivery_model": "container_service",
+      "execution_planes": ["native", "device", "external_service"],
+      "integration_contracts": []
+    },
+    {
+      "id": "pegaflow-vllm-connectors",
+      "artifact_type": "bridge",
+      "system_role": "kv_integration",
+      "delivery_model": "python_distribution",
+      "execution_planes": ["scheduler", "worker"],
+      "integration_contracts": [
+        "vllm.kv_connector.scheduler.v1",
+        "vllm.kv_connector.worker.v1"
+      ]
+    }
+  ],
+  "system_boundaries": {
+    "is": [
+      "an independently deployed KV storage, transfer, and metadata subsystem",
+      "a distribution containing vLLM scheduler and worker connectors"
+    ],
+    "is_not": [
+      "a vLLM runtime-core module",
+      "a single in-process plugin component",
+      "a cluster control plane"
+    ]
+  },
+  "validation": [
+    "cd python && uv run --extra test pytest",
+    "cargo test --release --no-default-features --features cuda-13,rdma",
+    "cd python && uv run --extra test pytest -m e2e tests/test_vllm_e2e_correctness.py --model <model> --max-model-len 4096"
+  ],
+  "compatibility_document": "python/tests/README.md"
+}

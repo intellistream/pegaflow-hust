@@ -17,6 +17,18 @@
 - **Production-ready observability** — built-in Prometheus metrics and OTLP export, not an afterthought
 - **Pluggable** — works with vLLM as a drop-in KV connector
 
+## Ecosystem classification
+
+PegaFlow is an independently deployed KV state and data-path system. It owns
+storage, transfer, metadata, and service lifecycles outside vLLM. The Python
+distribution also carries scheduler and worker connectors that adapt those
+services to vLLM's KV connector contracts.
+
+Accordingly, “plugin” describes how an adapter may be delivered; it is not the
+system's architecture role. PegaFlow is not part of the vLLM runtime core, and
+the connector is not the PegaFlow service itself. The machine-readable source
+for these boundaries is [`.vllm-hust/repository-profile.json`](./.vllm-hust/repository-profile.json).
+
 ## Research ownership
 
 Chen Zijia (`@mynameisczj`) and Chen Yanbo (`@cybber695`) jointly advance the
