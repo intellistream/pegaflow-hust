@@ -71,6 +71,14 @@ llm = LLM(
 )
 ```
 
+The legacy `pegaflow.connector.PegaKVConnector` export is lazy and resolves to
+the same implementation class used by the typed manifest. Bundle v1 separates
+the API telemetry provider so API processes do not import the scheduler/worker
+facade merely to decode connector metrics. Typed startup also requires an
+explicit host permission allowlist for `device_access`, `ipc`, and
+`network_egress`; declarations are auditable inputs and do not create an OS
+sandbox.
+
 #### Connector Modes
 
 `PegaKVConnector` defaults to `read_write`: it queries PegaFlow for reusable KV

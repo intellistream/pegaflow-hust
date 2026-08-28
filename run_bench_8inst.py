@@ -203,7 +203,11 @@ def _port_is_free(port: int) -> bool:
         probe.close()
 
 
-def run_preflight(model_path: str, min_free_mb: int) -> dict:
+def run_preflight(
+    model_path: str,
+    min_free_mb: int,
+    connector_config_mode: str,
+) -> dict:
     """Return auditable readiness evidence without starting or killing jobs."""
     binary = PROJECT_ROOT / "target" / "debug" / "pegaflow-server"
     ports = [SERVER_PORT, 9091, *range(VLLM_BASE_PORT, VLLM_BASE_PORT + 8)]
@@ -231,6 +235,10 @@ def run_preflight(model_path: str, min_free_mb: int) -> dict:
             free_memory.get(index, -1) >= min_free_mb for index in range(8)
         ),
         "output_directory_new": not LOG_DIR.exists(),
+        "typed_manifest": (
+            connector_config_mode == "legacy"
+            or (PROJECT_ROOT / "packaging" / "extension-bundle-v1.json").is_file()
+        ),
     }
     return {
         "provenance_label": "preflight-only",
@@ -241,6 +249,7 @@ def run_preflight(model_path: str, min_free_mb: int) -> dict:
         "python": sys.executable,
         "platform": platform.platform(),
         "model_path": model_path,
+        "connector_config_mode": connector_config_mode,
         "server_ports": ports,
         "npu_free_hbm_mb": free_memory,
         "minimum_free_hbm_mb": min_free_mb,
@@ -312,11 +321,53 @@ def start_server(free_npus: list[int], pool_size: str) -> subprocess.Popen:
     )
 
 
+def build_kv_transfer_config(
+    mode: str,
+    connector_config_mode: str,
+) -> dict:
+    extra_config = {
+        "pegaflow.mode": mode,
+        "pegaflow.transfer_backend": "ascend_direct",
+    }
+    if connector_config_mode == "legacy":
+        return {
+            "kv_connector": "PegaKVConnector",
+            "kv_role": "kv_both",
+            "kv_connector_module_path": "pegaflow.connector",
+            "kv_connector_extra_config": extra_config,
+        }
+    if connector_config_mode != "typed":
+        raise ValueError("connector_config_mode must be legacy or typed")
+    return {
+        "kv_role": "kv_both",
+        "kv_connector_selection": {
+            "schema_version": "1.0",
+            "composition": "single",
+            "connectors": [
+                {
+                    "connector_id": "pegaflow",
+                    "scheduler_component": "vllm-hust.pegaflow/scheduler",
+                    "worker_component": "vllm-hust.pegaflow/worker",
+                    "telemetry_component": "vllm-hust.pegaflow/telemetry",
+                    "scheduler_capabilities": {"supports_hma": False},
+                    "worker_capabilities": {
+                        "supports_hma": False,
+                        "requires_piecewise_for_cudagraph": False,
+                        "required_kv_cache_layout": None,
+                    },
+                }
+            ],
+        },
+        "kv_connector_extra_config": extra_config,
+    }
+
+
 def start_vllm(
     port: int, mode: str, namespace: str | None,
     physical_npu: int, label: str, *, model_path: str,
     gpu_memory_utilization: float = 0.85,
     use_pegaflow: bool = True,
+    connector_config_mode: str = "legacy",
 ) -> subprocess.Popen:
     log = LOG_DIR / f"vllm_{label}.log"
     env = os.environ.copy()
@@ -327,6 +378,14 @@ def start_vllm(
             env["PEGAFLOW_NAMESPACE"] = namespace
         env["PEGAFLOW_HOST"] = "http://127.0.0.1"
         env["PEGAFLOW_PORT"] = str(SERVER_PORT)
+        if connector_config_mode == "typed":
+            env["VLLM_EXTENSION_MANIFESTS"] = str(
+                PROJECT_ROOT / "packaging" / "extension-bundle-v1.json"
+            )
+            env["VLLM_EXTENSION_BUNDLES"] = "vllm-hust.pegaflow"
+            env["VLLM_EXTENSION_ALLOWED_PERMISSIONS"] = (
+                "device_access,ipc,network_egress"
+            )
     gmu = gpu_memory_utilization
     cmd_parts = [
         "source /root/miniconda3/etc/profile.d/conda.sh",
@@ -336,14 +395,9 @@ def start_vllm(
         f"--gpu-memory-utilization {gmu:.2f}",
     ]
     if use_pegaflow:
-        kv_cfg = json.dumps({
-            "kv_connector": "PegaKVConnector", "kv_role": "kv_both",
-            "kv_connector_module_path": "pegaflow.connector",
-            "kv_connector_extra_config": {
-                "pegaflow.mode": mode,
-                "pegaflow.transfer_backend": "ascend_direct",
-            },
-        })
+        kv_cfg = json.dumps(
+            build_kv_transfer_config(mode, connector_config_mode)
+        )
         cmd_parts.append(f"--kv-transfer-config '{kv_cfg}'")
     cmd = " && ".join([cmd_parts[0] + " && " + cmd_parts[1], " ".join(cmd_parts[2:])])
     proc = _track_proc(subprocess.Popen(
@@ -377,6 +431,7 @@ def launch_instances_opportunistically(
     poll_interval: int = 10,
     startup_max_wait: int = 3600,
     use_pegaflow: bool = True,
+    connector_config_mode: str = "legacy",
 ) -> list[tuple[dict, subprocess.Popen]]:
     """Start vLLM instances one-by-one as NPUs have enough free HBM.
 
@@ -475,6 +530,7 @@ def launch_instances_opportunistically(
                     npu, label, model_path=model_path,
                     gpu_memory_utilization=gmu,
                     use_pegaflow=use_pegaflow,
+                    connector_config_mode=connector_config_mode,
                 )
                 with rlock:
                     running.append((spec, proc))
@@ -624,6 +680,7 @@ def run_phase(
     min_free_mb: int = MIN_FREE_HBM_MB,
     use_pegaflow: bool = True,
     identical_prompts: bool = False,
+    connector_config_mode: str = "legacy",
 ) -> tuple[dict, set[int]]:
     """Run a full benchmark phase with opportunistic startup.
 
@@ -640,6 +697,7 @@ def run_phase(
         instance_specs, already_assigned, model_path,
         min_free_mb=min_free_mb,
         use_pegaflow=use_pegaflow,
+        connector_config_mode=connector_config_mode,
     )
 
     if len(running) < len(instance_specs):
@@ -774,6 +832,12 @@ def main() -> None:
         action="store_true",
         help="Record readiness without launching or terminating any service",
     )
+    parser.add_argument(
+        "--connector-config-mode",
+        choices=("legacy", "typed"),
+        default="legacy",
+        help="Select legacy module-path or typed Bundle v1 materialization",
+    )
     args = parser.parse_args()
 
     min_free_mb = args.min_free_gb * 1024
@@ -799,7 +863,11 @@ def main() -> None:
         else:
             print("  No fallback found; preflight will record the missing model")
 
-    preflight = run_preflight(model_path, min_free_mb)
+    preflight = run_preflight(
+        model_path,
+        min_free_mb,
+        args.connector_config_mode,
+    )
     LOG_DIR.mkdir(parents=True, exist_ok=False)
     (LOG_DIR / "preflight.json").write_text(
         json.dumps(preflight, indent=2, sort_keys=True), encoding="utf-8"
@@ -862,6 +930,7 @@ def main() -> None:
                 min_free_mb=min_free_mb,
                 use_pegaflow=True,
                 identical_prompts=args.identical,
+                connector_config_mode=args.connector_config_mode,
             )
             results_shared = metrics_s
             assigned_npus |= assigned_s
@@ -882,6 +951,7 @@ def main() -> None:
                 min_free_mb=min_free_mb,
                 use_pegaflow=False,
                 identical_prompts=args.identical,
+                connector_config_mode=args.connector_config_mode,
             )
             results_isolated = metrics_i
             assigned_npus |= assigned_i
@@ -971,6 +1041,7 @@ def main() -> None:
             json.dump({
                 "provenance_label": "real-online",
                 "preflight": preflight,
+                "connector_config_mode": args.connector_config_mode,
                 "benchmark": "8inst_shared_vs_isolated",
                 "model": str(Path(model_path).name),
                 "instances": NUM_INSTANCES,

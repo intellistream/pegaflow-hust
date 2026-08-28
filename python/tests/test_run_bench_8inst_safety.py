@@ -36,3 +36,26 @@ def test_port_probe_does_not_leave_a_listener() -> None:
     runner = load_runner()
     assert runner._port_is_free(18799)
     assert runner._port_is_free(18799)
+
+
+def test_legacy_and_typed_configs_are_mutually_exclusive() -> None:
+    runner = load_runner()
+    legacy = runner.build_kv_transfer_config("read_write", "legacy")
+    typed = runner.build_kv_transfer_config("read_write", "typed")
+
+    assert legacy["kv_connector"] == "PegaKVConnector"
+    assert legacy["kv_connector_module_path"] == "pegaflow.connector"
+    assert "kv_connector_selection" not in legacy
+    assert "kv_connector" not in typed
+    assert "kv_connector_module_path" not in typed
+    selection = typed["kv_connector_selection"]
+    connector = selection["connectors"][0]
+    assert connector["scheduler_component"] == "vllm-hust.pegaflow/scheduler"
+    assert connector["worker_component"] == "vllm-hust.pegaflow/worker"
+    assert connector["telemetry_component"] == "vllm-hust.pegaflow/telemetry"
+
+
+def test_typed_mode_declares_explicit_permission_allowlist() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "VLLM_EXTENSION_ALLOWED_PERMISSIONS" in source
+    assert '"device_access,ipc,network_egress"' in source

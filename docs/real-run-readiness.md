@@ -39,14 +39,19 @@ blocked preflight, not a negative performance result.
 
 ## Required equivalence matrix
 
-The current runner covers the legacy `PegaKVConnector` module-path mode only.
-It must not be used to claim typed Bundle v1 equivalence until the following
-matched pairs use the same commit, model, prompts, devices, ports, cache budget,
+The runner accepts `--connector-config-mode legacy|typed`. Typed mode selects
+the packaged split-role manifest and explicitly allows its declared
+`device_access`, `ipc`, and `network_egress` permissions. The following matched
+pairs must use the same commit, model, prompts, devices, ports, cache budget,
 request order, and server implementation:
 
 1. legacy module-path configuration;
 2. typed single-connector selection with an admitted PegaFlow manifest;
 3. rollback to the legacy configuration after removing typed selection.
+
+Run each mode into a different fresh output directory. The rollback run must be
+a new process start with `legacy`, no typed selection, and no extension manifest
+environment. A successful typed startup alone is not rollback evidence.
 
 For every pair retain raw request records, scheduler/worker/API telemetry,
 cache-hit evidence, failures, server logs, resolved configuration, and exact

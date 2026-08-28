@@ -19,17 +19,18 @@
       "artifact_type": "bridge",
       "system_role": "kv_integration",
       "delivery_model": "python_distribution",
-      "execution_planes": ["scheduler", "worker"],
+      "execution_planes": ["api", "scheduler", "worker"],
       "integration_contracts": [
         "vllm.kv_connector.scheduler.v1",
-        "vllm.kv_connector.worker.v1"
+        "vllm.kv_connector.worker.v1",
+        "vllm.kv_connector.telemetry.v1"
       ]
     }
   ],
   "system_boundaries": {
     "is": [
       "an independently deployed KV storage, transfer, and metadata subsystem",
-      "a distribution containing vLLM scheduler and worker connectors"
+      "a distribution containing split vLLM scheduler, worker, and API telemetry components"
     ],
     "is_not": [
       "a vLLM runtime-core module",

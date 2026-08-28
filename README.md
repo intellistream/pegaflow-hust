@@ -80,6 +80,15 @@ vllm serve Qwen/Qwen3-0.6B \
   --kv-transfer-config '{"kv_connector": "PegaKVConnector", "kv_role": "kv_both", "kv_connector_module_path": "pegaflow.connector"}'
 ```
 
+The command above is the compatible legacy module-path configuration. The
+experimental typed Bundle v1 path uses
+[`packaging/extension-bundle-v1.json`](./packaging/extension-bundle-v1.json),
+which declares separate scheduler, worker, and API telemetry components plus
+their actual permissions. See
+[`docs/real-run-readiness.md`](./docs/real-run-readiness.md) for the matched
+legacy/typed/rollback gate. Typed mode is not recommended until that real-online
+matrix is attached to the release record.
+
 > For full server options, multi-node setup, and advanced configuration, see [Server Configuration](./docs/server.md).
 
 ## Development
