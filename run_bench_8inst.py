@@ -49,6 +49,8 @@ from pathlib import Path
 # Config
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path("/workspace/HUST/pegaflow-hust")
+CORE_ROOT = Path("/workspace/HUST/vllm-hust")
+PYTHON_BIN = Path(sys.executable)
 LOG_ROOT = Path("/tmp/pegaflow-bench-8inst")
 LOG_DIR = LOG_ROOT / "not-started"
 
@@ -203,6 +205,36 @@ def _port_is_free(port: int) -> bool:
         probe.close()
 
 
+def _runtime_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    roots = [str(CORE_ROOT), str(PROJECT_ROOT / "python")]
+    if environment.get("PYTHONPATH"):
+        roots.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(roots)
+    return environment
+
+
+def _source_is_under(source: str | None, root: Path) -> bool:
+    if source is None:
+        return False
+    try:
+        Path(source).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _last_json_object(output: str) -> dict | None:
+    for line in reversed(output.splitlines()):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
 def run_preflight(
     model_path: str,
     min_free_mb: int,
@@ -212,21 +244,83 @@ def run_preflight(
     binary = PROJECT_ROOT / "target" / "debug" / "pegaflow-server"
     ports = [SERVER_PORT, 9091, *range(VLLM_BASE_PORT, VLLM_BASE_PORT + 8)]
     free_memory = get_npu_free_memory()
-    import_probe = subprocess.run(
-        [
-            "bash",
-            "-lc",
-            "source /root/miniconda3/etc/profile.d/conda.sh && "
-            "conda activate vllm-hust-dev && "
-            "python -c 'import torch, torch_npu, vllm, pegaflow'",
-        ],
-        text=True,
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
+    probe_code = """
+import importlib
+import json
+
+modules = {}
+for name in ("vllm", "vllm.engine.arg_utils", "pegaflow", "pegaflow.connector"):
+    try:
+        module = importlib.import_module(name)
+        modules[name] = {"ok": True, "file": getattr(module, "__file__", None)}
+    except Exception as exc:
+        modules[name] = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+print(json.dumps({"modules": modules}, sort_keys=True))
+"""
+    runtime_paths_ready = PYTHON_BIN.is_file() and CORE_ROOT.is_dir()
+    if runtime_paths_ready:
+        import_probe = subprocess.run(
+            [
+                str(PYTHON_BIN),
+                "-c",
+                probe_code,
+            ],
+            cwd=CORE_ROOT,
+            env=_runtime_environment(),
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    else:
+        import_probe = subprocess.CompletedProcess(
+            [str(PYTHON_BIN), "-c", probe_code],
+            1,
+            stdout="",
+            stderr="controlled Python or core root is missing",
+        )
+    import_payload = _last_json_object(import_probe.stdout) or {"modules": {}}
+    modules = import_payload["modules"]
+    if runtime_paths_ready:
+        cli_probe = subprocess.run(
+            [str(PYTHON_BIN), "-m", "vllm.entrypoints.cli.main", "--help"],
+            cwd=CORE_ROOT,
+            env=_runtime_environment(),
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    else:
+        cli_probe = subprocess.CompletedProcess(
+            [str(PYTHON_BIN), "-m", "vllm.entrypoints.cli.main", "--help"],
+            1,
+            stdout="",
+            stderr="controlled Python or core root is missing",
+        )
     checks = {
-        "runtime_imports": import_probe.returncode == 0,
+        "controlled_python": PYTHON_BIN.is_file(),
+        "core_root": CORE_ROOT.is_dir(),
+        "runtime_imports": import_probe.returncode == 0 and all(
+            modules.get(name, {}).get("ok")
+            for name in (
+                "vllm",
+                "vllm.engine.arg_utils",
+                "pegaflow",
+                "pegaflow.connector",
+            )
+        ),
+        "vllm_source": _source_is_under(
+            modules.get("vllm", {}).get("file"), CORE_ROOT
+        ),
+        "pegaflow_source": _source_is_under(
+            modules.get("pegaflow", {}).get("file"), PROJECT_ROOT
+        ),
+        "vllm_cli": cli_probe.returncode == 0 and "serve" in cli_probe.stdout,
         "model_directory": Path(model_path).is_dir(),
         "model_config": (Path(model_path) / "config.json").is_file(),
         "pegaflow_server_binary": binary.is_file() and os.access(binary, os.X_OK),
@@ -245,8 +339,13 @@ def run_preflight(
         "ready_for_real_online": all(checks.values()),
         "checks": checks,
         "git_commit": _git_head(PROJECT_ROOT),
+        "core_git_commit": _git_head(CORE_ROOT),
         "command": sys.argv,
-        "python": sys.executable,
+        "launcher_python": sys.executable,
+        "controlled_python": str(PYTHON_BIN),
+        "core_root": str(CORE_ROOT),
+        "runtime_modules": modules,
+        "vllm_cli_stderr": cli_probe.stderr[-2000:],
         "platform": platform.platform(),
         "model_path": model_path,
         "connector_config_mode": connector_config_mode,
@@ -370,7 +469,7 @@ def start_vllm(
     connector_config_mode: str = "legacy",
 ) -> subprocess.Popen:
     log = LOG_DIR / f"vllm_{label}.log"
-    env = os.environ.copy()
+    env = _runtime_environment()
     env["PYTHONHASHSEED"] = "0"
     env["ASCEND_RT_VISIBLE_DEVICES"] = str(physical_npu)
     if use_pegaflow:
@@ -387,21 +486,30 @@ def start_vllm(
                 "device_access,ipc,network_egress"
             )
     gmu = gpu_memory_utilization
-    cmd_parts = [
-        "source /root/miniconda3/etc/profile.d/conda.sh",
-        "conda activate vllm-hust-dev",
-        f"vllm serve {model_path} --port {port} --dtype float16",
-        f"--max-model-len 16384 --max-num-seqs 4",
-        f"--gpu-memory-utilization {gmu:.2f}",
+    command = [
+        str(PYTHON_BIN),
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        model_path,
+        "--port",
+        str(port),
+        "--dtype",
+        "float16",
+        "--max-model-len",
+        "16384",
+        "--max-num-seqs",
+        "4",
+        "--gpu-memory-utilization",
+        f"{gmu:.2f}",
     ]
     if use_pegaflow:
         kv_cfg = json.dumps(
             build_kv_transfer_config(mode, connector_config_mode)
         )
-        cmd_parts.append(f"--kv-transfer-config '{kv_cfg}'")
-    cmd = " && ".join([cmd_parts[0] + " && " + cmd_parts[1], " ".join(cmd_parts[2:])])
+        command.extend(["--kv-transfer-config", kv_cfg])
     proc = _track_proc(subprocess.Popen(
-        ["bash", "-c", cmd], env=env,
+        command, env=env, cwd=CORE_ROOT,
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
     ))
@@ -792,7 +900,7 @@ def extract_hit_rate() -> float:
 # =========================================================================
 
 def main() -> None:
-    global LOG_DIR, PROJECT_ROOT
+    global CORE_ROOT, LOG_DIR, PROJECT_ROOT, PYTHON_BIN
     parser = argparse.ArgumentParser(
         description="PegaFlow 8-Instance Shared Cache Benchmark"
     )
@@ -823,6 +931,18 @@ def main() -> None:
         help="PegaFlow checkout containing target/debug/pegaflow-server",
     )
     parser.add_argument(
+        "--core-root",
+        type=Path,
+        default=CORE_ROOT,
+        help="Exact vLLM-HUST checkout used by preflight and every server",
+    )
+    parser.add_argument(
+        "--python",
+        type=Path,
+        default=PYTHON_BIN,
+        help="Controlled interpreter used by preflight and every server",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         help="Fresh output directory; defaults to a timestamped directory",
@@ -842,6 +962,10 @@ def main() -> None:
 
     min_free_mb = args.min_free_gb * 1024
     PROJECT_ROOT = args.project_root.expanduser().resolve()
+    CORE_ROOT = args.core_root.expanduser().resolve()
+    # Preserve a virtual environment path instead of resolving its base-python
+    # symlink and silently losing pyvenv.cfg discovery.
+    PYTHON_BIN = args.python.expanduser().absolute()
 
     if args.output_dir is None:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())

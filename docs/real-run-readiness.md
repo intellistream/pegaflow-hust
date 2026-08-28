@@ -5,8 +5,9 @@ This runbook distinguishes readiness evidence from measured system results.
 ## Evidence labels
 
 - `preflight-only`: validates imports, model files, executable, ports, NPU
-  memory, output uniqueness, command, Python, platform, and Git revision. It
-  launches no service and proves no connector behavior.
+  memory, output uniqueness, exact core/provider sources, runnable CLI,
+  command, Python, platform, and both Git revisions. It launches no service and
+  proves no connector behavior.
 - `real-online`: the runner launched every PegaFlow and vLLM process, waited for
   health, issued live requests, saved raw logs, and stopped only those process
   groups it created.
@@ -30,12 +31,20 @@ starting a service and refuses to continue unless every preflight check passes.
 python run_bench_8inst.py \
   --preflight-only \
   --project-root /workspace/HUST/pegaflow-hust \
+  --core-root /workspace/HUST/vllm-hust \
+  --python /controlled/env/bin/python \
   --model /workspace/HUST/models/Qwen3-8B \
   --output-dir /new/path/tied-to-the-run
 ```
 
 Confirm the record reports `ready_for_real_online: true`. A false result is a
 blocked preflight, not a negative performance result.
+
+The controlled interpreter is also used for every vLLM service; the runner no
+longer activates a hard-coded root-owned Conda environment through a shell.
+Preflight requires `vllm`, its engine arguments, `pegaflow`, and its connector
+to resolve from the selected core/provider trees, then constructs the actual
+vLLM CLI. A namespace-only import or a different checkout fails closed.
 
 ## Required equivalence matrix
 
@@ -61,7 +70,8 @@ do not satisfy this gate.
 
 ## Current host observation
 
-The 2026-08-29 host-112 preflight found all eight 910B2 devices and the selected
-Qwen3-8B model available, with the requested ports free. It correctly refused
-to run because the PegaFlow server binary and controlled runtime environment
-were unavailable to the invoking user. This is `preflight-only` evidence.
+The 2026-08-29 host-112 rerun used an explicit controlled interpreter and core
+checkout. It verified exact vLLM source and engine imports, exact PegaFlow and
+connector source, the runnable vLLM CLI, all eight 910B2 devices, the selected
+model, typed manifest, and free ports. It correctly refused to run only because
+the PegaFlow server binary was not built. This is `preflight-only` evidence.
