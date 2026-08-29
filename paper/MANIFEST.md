@@ -2,7 +2,8 @@
 
 - Status: advisor-authored storyline draft; implementation and experiments remain student-owned.
 - Source base: `1c9f1fc48c1239a8f8813056aba6b6696ba41fe7` (`origin/main`).
-- Artifact commit: `PENDING_ARTIFACT_COMMIT`.
+- Artifact commit: `a45fceb8aa593e0aca4529a0489dbbe5f2d23fdd`.
+- Binding rule: this metadata-only commit immediately follows the artifact commit above; the recorded TeX, PDF, and transcript hashes bind the reviewed bytes without a self-referential commit hash.
 - TeX entrypoint: `paper/main.tex`.
 - Bibliography: `paper/references.bib` (intentionally empty pending verified related-work review).
 - Evidence ledger: `paper/EVIDENCE_LEDGER.md`.
