@@ -33,7 +33,11 @@ classifiers = [
 module-name = "pegaflow.pegaflow"
 python-source = "."
 # Automatically include binaries defined in Cargo.toml [[bin]] sections
-include = ["pegaflow/pegaflow-server-py", "pegaflow/pegaflow-metaserver-py"]
+include = [
+    "pegaflow/pegaflow-server-py",
+    "pegaflow/pegaflow-metaserver-py",
+    "pegaflow/manifests/extension-bundle-v1.json",
+]
 
 [project.optional-dependencies]
 test = [
@@ -56,6 +60,9 @@ pegaflow-metaserver = "pegaflow._metaserver:main"
 
 [project.entry-points."vllm.general_plugins"]
 pegaflow = "pegaflow.vllm_plugin:register"
+
+[project.entry-points."vllm.extension_bundles"]
+"vllm-hust.pegaflow" = "pegaflow.manifests"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

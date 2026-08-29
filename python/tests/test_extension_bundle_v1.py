@@ -1,6 +1,7 @@
 import importlib
 import json
 import sys
+import tomllib
 import types
 from pathlib import Path
 
@@ -11,6 +12,9 @@ from vllm.plugins.startup import resolve_extension_startup
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "packaging" / "extension-bundle-v1.json"
+WHEEL_MANIFEST = (
+    ROOT / "python" / "pegaflow" / "manifests" / "extension-bundle-v1.json"
+)
 
 
 def test_manifest_declares_split_roles_and_honest_permissions() -> None:
@@ -69,3 +73,18 @@ def test_manifest_is_closed_json_document() -> None:
     payload = json.loads(MANIFEST.read_text(encoding="utf-8"))
     assert payload["bundle_id"] == "vllm-hust.pegaflow"
     assert payload["host_api_range"] == ">=1,<2"
+
+
+def test_wheel_registers_the_same_static_manifest_without_import_hook() -> None:
+    project = tomllib.loads(
+        (ROOT / "python" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    entry_points = project["project"]["entry-points"]
+
+    assert entry_points["vllm.extension_bundles"] == {
+        "vllm-hust.pegaflow": "pegaflow.manifests"
+    }
+    assert WHEEL_MANIFEST.read_bytes() == MANIFEST.read_bytes()
+    assert "pegaflow/manifests/extension-bundle-v1.json" in (
+        project["tool"]["maturin"]["include"]
+    )

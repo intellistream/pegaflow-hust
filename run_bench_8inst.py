@@ -584,10 +584,6 @@ def start_vllm(
         env["PEGAFLOW_HOST"] = "http://127.0.0.1"
         env["PEGAFLOW_PORT"] = str(SERVER_PORT)
         if connector_config_mode == "typed":
-            env["VLLM_EXTENSION_MANIFESTS"] = str(
-                PROJECT_ROOT / "packaging" / "extension-bundle-v1.json"
-            )
-            env["VLLM_EXTENSION_BUNDLES"] = "vllm-hust.pegaflow"
             env["VLLM_EXTENSION_ALLOWED_PERMISSIONS"] = (
                 "device_access,ipc,network_egress"
             )
@@ -609,6 +605,8 @@ def start_vllm(
         "--gpu-memory-utilization",
         f"{gmu:.2f}",
     ]
+    if use_pegaflow and connector_config_mode == "typed":
+        command.extend(["--extension", "vllm-hust.pegaflow"])
     if use_pegaflow:
         kv_cfg = json.dumps(
             build_kv_transfer_config(mode, connector_config_mode)

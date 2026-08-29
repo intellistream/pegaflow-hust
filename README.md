@@ -84,7 +84,42 @@ The command above is the compatible legacy module-path configuration. The
 experimental typed Bundle v1 path uses
 [`packaging/extension-bundle-v1.json`](./packaging/extension-bundle-v1.json),
 which declares separate scheduler, worker, and API telemetry components plus
-their actual permissions. See
+their actual permissions. The Python wheel statically registers the same
+manifest, so no absolute manifest path is required:
+
+```bash
+vllm plugin inspect vllm-hust.pegaflow
+vllm plugin validate vllm-hust.pegaflow \
+  --allow-permission device_access \
+  --allow-permission ipc \
+  --allow-permission network_egress
+
+export VLLM_EXTENSION_ALLOWED_PERMISSIONS=device_access,ipc,network_egress
+vllm serve Qwen/Qwen3-0.6B \
+  --extension vllm-hust.pegaflow \
+  --kv-transfer-config '{
+    "kv_role": "kv_both",
+    "kv_connector_selection": {
+      "schema_version": "1.0",
+      "composition": "single",
+      "connectors": [{
+        "connector_id": "pegaflow",
+        "scheduler_component": "vllm-hust.pegaflow/scheduler",
+        "worker_component": "vllm-hust.pegaflow/worker",
+        "telemetry_component": "vllm-hust.pegaflow/telemetry",
+        "scheduler_capabilities": {"supports_hma": false},
+        "worker_capabilities": {
+          "supports_hma": false,
+          "requires_piecewise_for_cudagraph": false,
+          "required_kv_cache_layout": null
+        }
+      }]
+    }
+  }'
+```
+
+Installation only registers availability; `--extension` performs explicit
+activation. See
 [`docs/real-run-readiness.md`](./docs/real-run-readiness.md) for the matched
 legacy/typed/rollback gate. Typed mode is not recommended until that real-online
 matrix is attached to the release record.

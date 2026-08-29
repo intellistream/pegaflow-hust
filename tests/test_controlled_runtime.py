@@ -61,6 +61,9 @@ def test_typed_and_legacy_configs_remain_distinct() -> None:
     assert typed["kv_connector_selection"]["connectors"][0]["connector_id"] == (
         "pegaflow"
     )
+    source = RUNNER.read_text(encoding="utf-8")
+    assert 'command.extend(["--extension", "vllm-hust.pegaflow"])' in source
+    assert 'env["VLLM_EXTENSION_MANIFESTS"]' not in source
 
 
 def test_runtime_environment_includes_controlled_python_site_packages(
