@@ -1,0 +1,21 @@
+# PegaFlow paper artifact manifest
+
+- Status: advisor-authored storyline draft; implementation and experiments remain student-owned.
+- Source base: `1c9f1fc48c1239a8f8813056aba6b6696ba41fe7` (`origin/main`).
+- Artifact commit: `PENDING_ARTIFACT_COMMIT`.
+- TeX entrypoint: `paper/main.tex`.
+- Bibliography: `paper/references.bib` (intentionally empty pending verified related-work review).
+- Evidence ledger: `paper/EVIDENCE_LEDGER.md`.
+- Build command: `make -C paper TECTONIC=/home/shuhao/.conda/envs/neuromem/bin/tectonic`.
+- Tectonic exit code: `0`.
+- PDF: `paper/build/main.pdf`.
+- Full transcript: `paper/build/tectonic.log`.
+- PDF pages: `4`.
+- Visual inspection: all four pages rendered with `pdftoppm -png -r 120` and inspected individually; no clipping, overlap, accidental blank page, or unreadable table was found.
+- Build-log scan: no missing characters, undefined references, underfull boxes, overfull boxes, or Tectonic warnings.
+- `main.tex` SHA256: `23ac2e4985a99e20824330e5b6604317b5548789b8b9f5e11530b09a6999d177`.
+- `main.pdf` SHA256: `de44051edc51d6e9529aaaebcc29f4e18ee0367db213d686790672c6ef5d57e3`.
+- `tectonic.log` SHA256: `22078fd93b54abc208d8e31dd315dabc47dbf5c308bcebf96b80319849154aee`.
+- Host-only validation: `19 passed` from `python -m pytest -q test_trace_audit_dryrun.py`; `git diff --check` passed.
+- Highest current evidence: exploratory real-online serving-path trace; not paper-admissible because historical code/runtime custody is incomplete.
+- Open evidence gates: durable carrier/runtime refs, formal artifact inventory, reviewed native mechanism, frozen SLO thresholds, and a new matched oracle-closed run.
