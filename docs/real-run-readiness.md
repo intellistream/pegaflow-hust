@@ -114,3 +114,15 @@ Preflight now rejects those states through explicit NPU-runtime and Python-ABI
 checks. These probes are startup-failure evidence, not `real-online`; a complete
 CANN/HCCL environment, successful health probe, and fresh passing preflight are
 required before the equivalence matrix starts.
+
+A later read-only audit found all eight 910B2 devices idle with approximately
+62 GiB free HBM each, so accelerator capacity is currently available. The
+remaining gate is an ABI/package-set problem: the host identifies the CANN
+installation as `cann-9.0.0` with package version `26.0.rc1`, exposes
+`libhccl_v2.so` and related HCCL v2 libraries but no `libhccl.so`, while the
+installed torch-npu `2.10.0` and `2.10.0.post2` extension binaries both retain
+a direct `libhccl.so` dependency. After sourcing the shipped CANN environment
+and adding the matching Torch library directory, `ldd` reports only
+`libhccl.so` unresolved. Do not manufacture a compatibility symlink: install a
+vendor-supported complete CANN/HCCL and torch-npu package set, then repeat the
+import probe, server health check, and fresh preflight.
