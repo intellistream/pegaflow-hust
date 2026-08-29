@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -46,6 +47,8 @@ def test_runner_has_no_hard_coded_root_conda_activation() -> None:
     assert "cwd=CORE_ROOT" in source
     assert '"vllm.engine.arg_utils"' in source
     assert '"pegaflow.connector"' in source
+    assert '"platform_npu_runtime"' in source
+    assert '"server_python_abi"' in source
 
 
 def test_typed_and_legacy_configs_remain_distinct() -> None:
@@ -58,3 +61,28 @@ def test_typed_and_legacy_configs_remain_distinct() -> None:
     assert typed["kv_connector_selection"]["connectors"][0]["connector_id"] == (
         "pegaflow"
     )
+
+
+def test_runtime_environment_includes_controlled_python_site_packages(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    module.PYTHON_BIN = Path(sys.executable)
+    module.CORE_ROOT = tmp_path / "core"
+    module.PROJECT_ROOT = tmp_path / "provider"
+
+    metadata = module._controlled_python_metadata(str(module.PYTHON_BIN))
+    environment = module._runtime_environment()
+    python_paths = environment["PYTHONPATH"].split(os.pathsep)
+
+    assert "error" not in metadata
+    assert str(module.CORE_ROOT) == python_paths[0]
+    assert str(module.PROJECT_ROOT / "python") == python_paths[1]
+    assert set(metadata["site_packages"]).issubset(python_paths)
+    if metadata["libdir"]:
+        assert environment["LD_LIBRARY_PATH"].split(os.pathsep)[0] == metadata["libdir"]
+    if metadata["prefix"] != metadata["base_prefix"]:
+        assert environment["VIRTUAL_ENV"] == metadata["prefix"]
+        assert environment["PATH"].split(os.pathsep)[0] == str(
+            Path(metadata["prefix"]) / "bin"
+        )

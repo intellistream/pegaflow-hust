@@ -44,7 +44,38 @@ The controlled interpreter is also used for every vLLM service; the runner no
 longer activates a hard-coded root-owned Conda environment through a shell.
 Preflight requires `vllm`, its engine arguments, `pegaflow`, and its connector
 to resolve from the selected core/provider trees, then constructs the actual
-vLLM CLI. A namespace-only import or a different checkout fails closed.
+vLLM CLI. It also requires an available `torch.npu` runtime and verifies that
+the server binary resolves the controlled interpreter's exact Python shared
+library. A namespace-only import, a CUDA-only Torch environment, an unresolved
+Python ABI, or a different checkout fails closed.
+
+The PegaFlow server embeds Python through PyO3, so it must be built against the
+same controlled interpreter. Its virtual-environment site packages, executable
+directory, prefix, and Python shared-library directory are also materialized
+into the server process environment; selecting the interpreter only for vLLM
+subprocesses is insufficient.
+
+## Reproducible Ascend server build
+
+The protobuf compiler is vendored by `pegaflow-proto`; a host-wide `protoc`
+installation is not required. Build the debug binary consumed by this runner
+with the controlled interpreter and the host's CANN environment:
+
+```bash
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="${PYTHONPATH:-}"
+export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+source /usr/local/Ascend/cann/set_env.sh
+export PATH="$HOME/.cargo/bin:$PATH"
+export PYO3_PYTHON=/controlled/env/bin/python
+cargo build -p pegaflow-server \
+  --no-default-features --features ascend --bin pegaflow-server
+```
+
+After the build, run preflight with the same `--python` path. Before claiming
+`real-online`, also start the binary with a small pool on an otherwise unused
+device and require a successful `/health` response; this catches Python ABI,
+site-package, CANN-load, and dynamic-library mismatches that `--help` cannot.
 
 ## Required equivalence matrix
 
@@ -73,5 +104,13 @@ do not satisfy this gate.
 The 2026-08-29 host-112 rerun used an explicit controlled interpreter and core
 checkout. It verified exact vLLM source and engine imports, exact PegaFlow and
 connector source, the runnable vLLM CLI, all eight 910B2 devices, the selected
-model, typed manifest, and free ports. It correctly refused to run only because
-the PegaFlow server binary was not built. This is `preflight-only` evidence.
+model, typed manifest, free ports, and a locally built Ascend server binary.
+The initial typed preflight reported `ready_for_real_online: true`, but its
+platform gate was incomplete. Server probes initialized ACL and detected runtime
+1.17.0, then exposed first a system-Python build and, after a controlled-Python
+rebuild, a CUDA-only Torch environment. Host-installed NPU environments also
+failed to load `torch_npu` because the CANN installation has no `libhccl.so`.
+Preflight now rejects those states through explicit NPU-runtime and Python-ABI
+checks. These probes are startup-failure evidence, not `real-online`; a complete
+CANN/HCCL environment, successful health probe, and fresh passing preflight are
+required before the equivalence matrix starts.

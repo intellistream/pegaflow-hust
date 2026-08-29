@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import functools
 import json
 import os
 import platform
@@ -205,12 +206,60 @@ def _port_is_free(port: int) -> bool:
         probe.close()
 
 
+@functools.lru_cache(maxsize=8)
+def _controlled_python_metadata(python: str) -> dict:
+    probe = subprocess.run(
+        [
+            python,
+            "-c",
+            (
+                "import json, site, sys, sysconfig; "
+                "print(json.dumps({"
+                "'executable': sys.executable, "
+                "'prefix': sys.prefix, "
+                "'base_prefix': sys.base_prefix, "
+                "'libdir': sysconfig.get_config_var('LIBDIR'), "
+                "'instsoname': sysconfig.get_config_var('INSTSONAME'), "
+                "'site_packages': site.getsitepackages()"
+                "}, sort_keys=True))"
+            ),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    payload = _last_json_object(probe.stdout)
+    if probe.returncode != 0 or payload is None:
+        return {
+            "error": probe.stderr[-2000:] or "controlled Python metadata probe failed",
+            "returncode": probe.returncode,
+        }
+    return payload
+
+
 def _runtime_environment() -> dict[str, str]:
     environment = os.environ.copy()
-    roots = [str(CORE_ROOT), str(PROJECT_ROOT / "python")]
+    python_metadata = _controlled_python_metadata(str(PYTHON_BIN))
+    roots = [
+        str(CORE_ROOT),
+        str(PROJECT_ROOT / "python"),
+        *python_metadata.get("site_packages", []),
+    ]
     if environment.get("PYTHONPATH"):
         roots.append(environment["PYTHONPATH"])
     environment["PYTHONPATH"] = os.pathsep.join(roots)
+    prefix = python_metadata.get("prefix")
+    if prefix and prefix != python_metadata.get("base_prefix"):
+        environment["VIRTUAL_ENV"] = prefix
+        environment["PATH"] = os.pathsep.join(
+            [str(Path(prefix) / "bin"), environment.get("PATH", "")]
+        )
+    libdir = python_metadata.get("libdir")
+    if libdir:
+        environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [libdir, environment.get("LD_LIBRARY_PATH", "")]
+        )
     return environment
 
 
@@ -259,9 +308,34 @@ for name in ("vllm", "vllm.engine.arg_utils", "pegaflow", "pegaflow.connector"):
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
-print(json.dumps({"modules": modules}, sort_keys=True))
+
+try:
+    import torch
+    import torch_npu
+
+    platform_runtime = {
+        "ok": hasattr(torch, "npu") and bool(torch.npu.is_available()),
+        "torch_version": torch.__version__,
+        "torch_npu_version": getattr(torch_npu, "__version__", None),
+    }
+except Exception as exc:
+    platform_runtime = {
+        "ok": False,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+
+print(json.dumps({
+    "modules": modules,
+    "platform_runtime": platform_runtime,
+}, sort_keys=True))
 """
     runtime_paths_ready = PYTHON_BIN.is_file() and CORE_ROOT.is_dir()
+    python_metadata = (
+        _controlled_python_metadata(str(PYTHON_BIN))
+        if PYTHON_BIN.is_file()
+        else {"error": "controlled Python is missing"}
+    )
     if runtime_paths_ready:
         import_probe = subprocess.run(
             [
@@ -285,6 +359,7 @@ print(json.dumps({"modules": modules}, sort_keys=True))
         )
     import_payload = _last_json_object(import_probe.stdout) or {"modules": {}}
     modules = import_payload["modules"]
+    platform_runtime = import_payload.get("platform_runtime", {"ok": False})
     if runtime_paths_ready:
         cli_probe = subprocess.run(
             [str(PYTHON_BIN), "-m", "vllm.entrypoints.cli.main", "--help"],
@@ -302,8 +377,27 @@ print(json.dumps({"modules": modules}, sort_keys=True))
             stdout="",
             stderr="controlled Python or core root is missing",
         )
+    if binary.is_file() and python_metadata.get("instsoname"):
+        binary_link_probe = subprocess.run(
+            ["ldd", str(binary)],
+            env=_runtime_environment(),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        expected_python_library = python_metadata["instsoname"]
+    else:
+        binary_link_probe = subprocess.CompletedProcess(
+            ["ldd", str(binary)],
+            1,
+            stdout="",
+            stderr="server binary or controlled Python library metadata is missing",
+        )
+        expected_python_library = None
     checks = {
         "controlled_python": PYTHON_BIN.is_file(),
+        "controlled_python_environment": "error" not in python_metadata,
         "core_root": CORE_ROOT.is_dir(),
         "runtime_imports": import_probe.returncode == 0 and all(
             modules.get(name, {}).get("ok")
@@ -314,6 +408,7 @@ print(json.dumps({"modules": modules}, sort_keys=True))
                 "pegaflow.connector",
             )
         ),
+        "platform_npu_runtime": platform_runtime.get("ok", False),
         "vllm_source": _source_is_under(
             modules.get("vllm", {}).get("file"), CORE_ROOT
         ),
@@ -324,6 +419,12 @@ print(json.dumps({"modules": modules}, sort_keys=True))
         "model_directory": Path(model_path).is_dir(),
         "model_config": (Path(model_path) / "config.json").is_file(),
         "pegaflow_server_binary": binary.is_file() and os.access(binary, os.X_OK),
+        "server_python_abi": (
+            binary_link_probe.returncode == 0
+            and expected_python_library is not None
+            and expected_python_library in binary_link_probe.stdout
+            and f"{expected_python_library} => not found" not in binary_link_probe.stdout
+        ),
         "ports_free": all(_port_is_free(port) for port in ports),
         "eight_npus_ready": all(
             free_memory.get(index, -1) >= min_free_mb for index in range(8)
@@ -343,8 +444,11 @@ print(json.dumps({"modules": modules}, sort_keys=True))
         "command": sys.argv,
         "launcher_python": sys.executable,
         "controlled_python": str(PYTHON_BIN),
+        "controlled_python_metadata": python_metadata,
         "core_root": str(CORE_ROOT),
         "runtime_modules": modules,
+        "platform_runtime": platform_runtime,
+        "server_link_probe_stderr": binary_link_probe.stderr[-2000:],
         "vllm_cli_stderr": cli_probe.stderr[-2000:],
         "platform": platform.platform(),
         "model_path": model_path,
@@ -404,6 +508,8 @@ def start_server(free_npus: list[int], pool_size: str) -> subprocess.Popen:
             "--devices", devices,
         ],
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
+        cwd=PROJECT_ROOT,
+        env=_runtime_environment(),
         preexec_fn=os.setsid,
     ))
     deadline = time.time() + 30
