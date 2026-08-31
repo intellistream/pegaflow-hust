@@ -268,12 +268,14 @@ results are visible.
 
 \section{Related-Work Boundary}
 
-This repository does not yet contain a reviewed scholarly bibliography, so this
-draft deliberately makes no external citation claim.  The comparison space is
-nevertheless explicit.  External KV stores and connectors establish that KV
-state can outlive one inference process.  Prefix caches establish reuse within
-an engine.  Generic transfer engines optimize bytes, registration, and fabric
-movement.  Queueing and SLO controllers choose request-level service actions.
+PagedAttention establishes block-granular KV-cache management inside an LLM
+serving engine~\cite{kwon2023pagedattention}, while Mooncake makes KV state a
+disaggregated serving resource and reports the storage--computation tradeoff of
+moving it across a KV-centric data path~\cite{qin2025mooncake}.  These systems
+motivate, but do not themselves establish, PegaFlow's proposed receipt-bound
+break-even predictor.  Prefix caches establish reuse within an engine; generic
+transfer engines optimize bytes, registration, and fabric movement; queueing
+and SLO controllers choose request-level service actions.
 PegaFlow's proposed paper boundary is the intersection: predicting a
 request-level reuse break-even from lifecycle-bound transfer phases in an
 existing sidecar data path.  A later related-work pass must add only verified
@@ -301,8 +303,7 @@ the native mechanism, and matched evaluation close, this remains a
 well-specified hypothesis with exploratory evidence rather than a completed
 systems result.
 
-\section*{Bibliography status}
-The accompanying \artifact{references.bib} is intentionally empty at this
-stage.  No external citation was added without a repository-verifiable source.
+\bibliographystyle{plain}
+\bibliography{references}
 
 \end{document}
