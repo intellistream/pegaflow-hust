@@ -2,21 +2,22 @@
 
 - Status: advisor-authored storyline draft; implementation and experiments remain student-owned.
 - Source base: `1c9f1fc48c1239a8f8813056aba6b6696ba41fe7` (`origin/main`).
-- Artifact commit: `a45fceb8aa593e0aca4529a0489dbbe5f2d23fdd`.
+- Artifact commit: `1a5b4a6290341cdda49979f91397319d0a5a7afe`.
 - Binding rule: this metadata-only commit immediately follows the artifact commit above; the recorded TeX, PDF, and transcript hashes bind the reviewed bytes without a self-referential commit hash.
 - TeX entrypoint: `paper/main.tex`.
-- Bibliography: `paper/references.bib` (intentionally empty pending verified related-work review).
+- Bibliography: `paper/references.bib` (2 verified primary-source entries, both cited in the paper).
 - Evidence ledger: `paper/EVIDENCE_LEDGER.md`.
 - Build command: `make -C paper TECTONIC=/home/shuhao/.conda/envs/neuromem/bin/tectonic`.
 - Tectonic exit code: `0`.
 - PDF: `paper/build/main.pdf`.
 - Full transcript: `paper/build/tectonic.log`.
-- PDF pages: `4`.
-- Visual inspection: all four pages rendered with `pdftoppm -png -r 120` and inspected individually; no clipping, overlap, accidental blank page, or unreadable table was found.
+- PDF pages: `5`.
+- Visual inspection: all five pages rendered with `pdftoppm -png -r 70` and inspected individually; no clipping, overlap, accidental blank page, or unreadable table was found.
 - Build-log scan: no missing characters, undefined references, underfull boxes, overfull boxes, or Tectonic warnings.
-- `main.tex` SHA256: `23ac2e4985a99e20824330e5b6604317b5548789b8b9f5e11530b09a6999d177`.
-- `main.pdf` SHA256: `de44051edc51d6e9529aaaebcc29f4e18ee0367db213d686790672c6ef5d57e3`.
-- `tectonic.log` SHA256: `22078fd93b54abc208d8e31dd315dabc47dbf5c308bcebf96b80319849154aee`.
+- `main.tex` SHA256: `f4f7eed9f66421ed30fe513f1cf8ab2269c2f5f7432c4cb0c2cbf75e539e4555`.
+- `references.bib` SHA256: `95f854f2b071b7601d377bc9134caea5ca6cb3cf74d7e127dbf9448c261b9349`.
+- `main.pdf` SHA256: `841958e731fe60134a694ec45b836b09429a7478811aa7a59134464da1bd5813`.
+- `tectonic.log` SHA256: `fcdd92f990e2e2c075334698bc8de349d801078d733818b20be0036ca5f17adf`.
 - Host-only validation: `19 passed` from `python -m pytest -q test_trace_audit_dryrun.py`; `git diff --check` passed.
 - Highest current evidence: exploratory real-online serving-path trace; not paper-admissible because historical code/runtime custody is incomplete.
 - Open evidence gates: durable carrier/runtime refs, formal artifact inventory, reviewed native mechanism, frozen SLO thresholds, and a new matched oracle-closed run.
