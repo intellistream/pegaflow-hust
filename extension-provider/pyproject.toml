@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-hust-pegaflow-provider"
+version = "0.2.0.dev0"
+description = "PegaFlow host provider for vLLM-HUST Extension Manager"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+license = {text = "Apache-2.0"}
+dependencies = ["vllm-hust-ext==0.2.0.dev0"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "ruff>=0.12"]
+
+[project.entry-points."vllm_hust.extension_bundles"]
+"org.vllm-hust.pegaflow" = "vllm_hust_pegaflow_provider.manifests"
+
+[project.entry-points."vllm_hust_ext.providers"]
+pegaflow = "vllm_hust_pegaflow_provider.provider:PegaFlowProvider"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vllm_hust_pegaflow_provider"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/vllm_hust_pegaflow_provider/manifests/vllm-hust-extension-v0.2.json" = "vllm_hust_pegaflow_provider/manifests/vllm-hust-extension-v0.2.json"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]

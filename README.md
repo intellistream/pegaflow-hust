@@ -1,5 +1,12 @@
 # Pegaflow
 
+PegaFlow is an external KV-cache storage and transfer system. Its vLLM
+connectors are adapters to that system; the server itself is not an in-process
+vLLM plugin. The optional `extension-provider/` package integrates PegaFlow
+with vLLM-HUST Extension Manager using read-only `check`, `plan`, and `render`
+operations. Service lifecycle and stored data remain controlled by the
+external operator.
+
 <div align="center">
   <img src="./assets/logo.png" width="200" />
   <p><strong><em>KV cache on the wings of Pegasus.</em></strong></p>

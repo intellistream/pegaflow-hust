@@ -1,0 +1,50 @@
+{
+  "schema_version": "0.2-experimental",
+  "extension_id": "org.vllm-hust.pegaflow",
+  "extension_version": "0.2.0.dev0",
+  "kind": "kv_service_adapter",
+  "host": {
+    "provider": "pegaflow",
+    "name": "pegaflow-llm-npu",
+    "version_range": "==0.23.3"
+  },
+  "runtime": {
+    "type": "composite",
+    "process_scope": "external_service_and_vllm_connector",
+    "isolation": "external_service"
+  },
+  "lifecycle_owner": "external_operator",
+  "protocols": [
+    {"name": "pegaflow-engine", "version_range": "==0.23.3"},
+    {"name": "vllm-kv-transfer-config", "version_range": null}
+  ],
+  "implementation": [
+    {
+      "type": "external_service",
+      "service": "PegaFlow Server",
+      "source_repository": "https://github.com/vLLM-HUST/pegaflow-hust",
+      "console_scripts": ["pegaflow-server", "pegaflow-metaserver"]
+    },
+    {
+      "type": "python_entry_point",
+      "group": "vllm.general_plugins",
+      "name": "pegaflow"
+    }
+  ],
+  "requires_services": [
+    {
+      "service_id": "pegaflow-server",
+      "protocol": "http-health",
+      "version_range": null,
+      "endpoint_config": "health_url",
+      "optional": false
+    }
+  ],
+  "activation": {
+    "entry_points": [
+      {"group": "vllm.general_plugins", "name": "pegaflow"}
+    ],
+    "environment": {},
+    "additional_config": {}
+  }
+}
