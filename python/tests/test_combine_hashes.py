@@ -658,3 +658,106 @@ class TestSchedulerQueryProbeReuse:
 
         assert "r1" not in sc._pending_query_probes
         engine_client.release.assert_called_once_with(b"lease-1")
+
+
+# ---------------------------------------------------------------------------
+# Tests — span-aware block keys (DeepSeek-V4 heterogeneous layout)
+#
+# vLLM's hash chain is cumulative: the hash at chain position i fingerprints
+# the whole prefix up to i. A physical block spanning `span` chain positions
+# must therefore be keyed by the cumulative hash at its COMPLETED end boundary
+# ((k+1)*span - 1), never by the first position of its region — the latter
+# aliases any two prefixes that share only the block's opening slice.
+# ---------------------------------------------------------------------------
+
+SPAN = 64  # 512-token MLA block over an 8-token chain
+
+
+def _make_span_connector() -> SchedulerConnector:
+    from pegaflow.connector.scheduler import SchedulerConnector
+
+    ctx = _make_ctx(block_size=8, dcp_world_size=1, pcp_world_size=1)
+    sc = SchedulerConnector(ctx)
+    # Fake a 512-token single hash group over the 8-token chain (span 64).
+    sc._cache_groups = SimpleNamespace(
+        group_block_sizes=(512,),
+        hash_group_index=0,
+        group_count=1,
+        has_recurrent_state=False,
+    )
+    return sc
+
+
+def test_span_save_keys_on_completed_end_boundary_hash():
+    """A completed physical block is saved under the cumulative hash at its
+    end boundary, not the first hash of its region."""
+    sc = _make_span_connector()
+    # Two full 512-token blocks = 128 chain positions; chain hashes are
+    # cumulative, so position 63 / 127 each encode a full block.
+    hashes = [_hash(i) for i in range(128)]
+    sc._block_hashes["r1"] = tuple(hashes)
+    sc._allocated_blocks["r1"] = [[10, 11]]
+    sc._scheduled_tokens["r1"] = 1024  # 128 * 8 tokens
+
+    intent = sc._consume_save_intent("r1")
+    assert intent is not None
+    assert intent.block_ids == (10, 11)
+    # Keys = end-boundary hashes, NOT region-first hashes.
+    assert intent.block_hashes == (hashes[63], hashes[127])
+    assert intent.block_hashes != (hashes[0], hashes[64])
+
+
+def test_span_query_submits_end_boundary_hashes():
+    """The backend query asks for the same end-boundary keys the save path
+    stores under — otherwise saves are unreachable."""
+
+    sc = _make_span_connector()
+    # Query through the connector's probe machinery with a stubbed shard
+    # client so we can observe the exact hash list sent to the backend.
+    hashes = [_hash(i) for i in range(128)]
+    seen: dict[str, object] = {}
+
+    class _FakeReady:
+        num_hit_blocks = 0
+        leases: tuple = ()
+        recurrent_hold = None
+        usable_positions: frozenset = frozenset()
+
+    class _FakeShards:
+        def query(self, instance_id, block_hash_list, req_id, wait_for_full_prefix):
+            seen["hashes"] = list(block_hash_list)
+            return _FakeReady()
+
+    sc._tp_shard_client = _FakeShards()  # type: ignore[assignment]
+    sc._count_available_block_prefix(hashes, "r1")
+    assert seen["hashes"] == [hashes[63], hashes[127]], seen["hashes"]
+
+
+def test_span_blocks_sharing_only_first_slice_do_not_alias():
+    """Negative regression: two prefixes that share only the first chain hash
+    of a physical block (but diverge inside it) must select DIFFERENT keys —
+    the second request can never restore the first one's KV."""
+    shared = _hash("shared-open")
+    a = [shared] + [_hash(f"a-{i}") for i in range(1, SPAN)]
+    b = [shared] + [_hash(f"b-{i}") for i in range(1, SPAN)]  # diverges at i=1
+
+    assert a[0] == b[0], "test premise: first chain hash shared"
+    # Old (buggy) key selection: region-first hash -> identical keys.
+    assert a[0] == b[0]
+    # Fixed key selection: end-boundary hashes differ because the blocks'
+    # contents differ after the shared opening.
+    key_a = SchedulerConnector._block_end_hashes(a, SPAN)
+    key_b = SchedulerConnector._block_end_hashes(b, SPAN)
+    assert key_a == (a[SPAN - 1],)
+    assert key_b == (b[SPAN - 1],)
+    assert key_a != key_b, "divergent in-block prefixes must not alias"
+
+
+def test_span_whole_prefix_reuse_still_hits():
+    """Identical prefixes keep producing identical end-boundary keys, so the
+    full-prefix-reuse workloads still hit after the key fix."""
+    hashes_a = [_hash(f"x-{i}") for i in range(SPAN)]
+    hashes_b = [_hash(f"x-{i}") for i in range(SPAN)]  # identical prefix
+    key_a = SchedulerConnector._block_end_hashes(hashes_a, SPAN)
+    key_b = SchedulerConnector._block_end_hashes(hashes_b, SPAN)
+    assert key_a == key_b == (hashes_a[SPAN - 1],)

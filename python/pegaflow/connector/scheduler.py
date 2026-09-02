@@ -787,14 +787,19 @@ class SchedulerConnector:
                 return None
         elif span > 1:
             # DeepSeek-V4: hash-group physical blocks span `span` chain
-            # positions. Pair each completed block with the first hash of its
-            # region; groups whose block size differs from the chain granularity
+            # positions. Pair each completed block with the cumulative hash at
+            # its completed END boundary — the only chain hash that uniquely
+            # fingerprints the full block (keying the region's first hash
+            # would alias prefixes sharing only the block's opening slice).
+            # Groups whose block size differs from the chain granularity
             # cannot pair 1:1 at all and are skipped (save-only would need
             # per-group hash chains — official future work).
             hash_group = self._cache_groups.hash_group_index
             g_start = hash_start // span
             g_saveable = saveable_block_idx // span
-            sampled_hashes = block_hashes[g_start * span : g_saveable * span : span]
+            sampled_hashes = self._block_end_hashes(
+                block_hashes[g_start * span:g_saveable * span], span
+            )
             save_block_ids_by_group = tuple(
                 tuple(
                     group[g_start:g_saveable]
@@ -997,6 +1002,23 @@ class SchedulerConnector:
         self._pending_saves.discard(req_id)
         self._tail_saved.discard(req_id)
 
+    @staticmethod
+    def _block_end_hashes(chain: Iterable[bytes], span: int) -> tuple[bytes, ...]:
+        """One key per physical block: the cumulative hash at each block's
+        COMPLETED end boundary.
+
+        vLLM's hash chain is cumulative (each hash fingerprints the whole
+        prefix up to it), so the hash at position `(k + 1) * span - 1` — the
+        last chain position inside block k — uniquely encodes block k's full
+        content. Keying on the FIRST position of a block would alias any two
+        prefixes that share only that block's opening slice.
+        """
+        chain = list(chain)
+        if span <= 1:
+            return tuple(chain)
+        # positions span-1, 2*span-1, 3*span-1, ... (last position per block)
+        return tuple(chain[span - 1::span])
+
     @property
     def _hash_group_span(self) -> int:
         """Hash-chain positions covered by one physical hash-group block.
@@ -1026,11 +1048,12 @@ class SchedulerConnector:
         block_hash_list = list(block_hashes)
         span = self._hash_group_span
         if span > 1:
-            # DeepSeek-V4: query one hash per physical hash-group block (the
-            # first chain position of each block). The backend stores blocks
-            # under exactly those keys; hit counts are expanded back to chain
-            # units in _QueryProbe.mark_ready.
-            block_hash_list = block_hash_list[0::span]
+            # DeepSeek-V4: query the completed end-boundary hash of each
+            # physical hash-group block (chain is cumulative; the last chain
+            # position inside a block uniquely fingerprints it). The backend
+            # stores blocks under exactly those keys; hit counts are expanded
+            # back to chain units in _QueryProbe.mark_ready.
+            block_hash_list = self._block_end_hashes(block_hash_list, span)
         ready = self._tp_shard_client.query(
             self._ctx.instance_id,
             block_hash_list,
