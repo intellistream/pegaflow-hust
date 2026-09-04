@@ -3,307 +3,200 @@
 \usepackage{booktabs}
 \usepackage{longtable}
 \usepackage{array}
-\usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
 \usepackage{microtype}
+\setlength{\emergencystretch}{2em}
 
-\newcommand{\artifact}[1]{\texttt{#1}}
-\newcommand{\tbd}{\textbf{unverified hypothesis}}
-
-\title{PegaFlow: Predicting When Shared KV Transport Beats Recompute on Heterogeneous Accelerators}
+\title{PegaFlow: Tail-Predictable Host-Memory Pooling for Disaggregated LLM Serving}
 \author{Advisor-authored storyline draft; implementation and experiments remain student-owned}
-\date{M0 paper-asset closure, August 2026}
+\date{September 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-External KV-cache storage can replace repeated prefill with storage lookup and
-device transfer, but a cache hit is not itself a latency win.  PegaFlow already
-provides a sidecar storage engine, a vLLM connector, host and SSD backing, and
-cross-node transport.  Its repository also preserves both favorable and
-unfavorable serving traces.  Those traces motivate a narrower systems question:
-can a phase-aware break-even contract predict when saved prefill exceeds
-packing, transfer, queueing, and materialization cost without reversing
-time-to-first-token?  We formulate an architecture-guided mechanism hypothesis,
-a fail-closed evidence ledger, and a matched evaluation contract.  Existing
-artifacts remain exploratory because their historical code and runtime custody
-is incomplete; consequently this draft reports no publishable performance
-result.  On Ascend, the current contribution is a porting/adaptation carrier
-plus a falsifiable native-mechanism hypothesis, not a completed
-architecture-native mechanism.
+Disaggregated LLM serving can enlarge its KV cache by pooling CPU memory on
+both prefill and decode nodes. The extra capacity is useful only if remote
+reads, refill, and migration do not turn shared RDMA into an uncontrolled tail
+latency path. We ask whether object placement and transfer budgets can be
+jointly controlled so that both host-memory pools extend useful KV residence
+while request p99 remains predictable. PegaFlow already contains host and SSD
+backing, a vLLM connector, cross-node transport, and exploratory serving
+traces. Those traces are not yet paper-admissible because historical code and
+runtime custody is incomplete; they establish neither an RDMA-tail pathology
+nor a benefit. We therefore formulate an object-lifecycle-aware placement and
+transfer mechanism, its strongest baselines, and a fail-closed evaluation
+contract. Cache TTL is treated as an outcome under a fixed total byte budget,
+not a configurable success metric. No new performance or NPU claim is made in
+this draft.
 \end{abstract}
 
-\section{Introduction}
+\section{Problem and Representative Setting}
 
-Long-context serving repeatedly materializes large KV states.  PegaFlow moves
-that state outside an inference process and lets instances reuse it through a
-shared store.  This separation creates a clean systems opportunity---replace
-prefill with lookup and transfer---but it also adds a new critical path.  A hit
-must be packed or registered, moved through host and device memory, scheduled
-against concurrent transfers, materialized into the consumer layout, and
-matched to the correct request lifecycle.  Average hit rate or aggregate
-throughput therefore cannot determine whether reuse improves a request's SLO.
+Paged KV management makes cache capacity and fragmentation first-class serving
+concerns~\cite{kwon2023pagedattention}. Systems such as Mooncake go further by
+using CPU memory, SSD, and NIC resources across disaggregated prefill and decode
+clusters~\cite{qin2025mooncake}. This creates a stronger baseline than
+decode-local caching: both sides' memory can contribute to a distributed pool.
 
-The repository's own evidence sharpens the problem.  Its preregistration states
-the basic inequality ``saved prefill exceeds DMA cost.''  Historical traces
-also retain regimes where burst concurrency reverses TTFT and where compressed
-KV leaves little useful gap.  At the same time, repository issue~18 records a
-custody defect: most historical PegaFlow and external runtime commits are not
-reachable from durable refs.  We use these observations only to motivate a
-question and freeze an evaluation; we do not promote their numbers into paper
-claims.
+The representative setting is long-context P/D serving in which a decode node
+frequently consumes KV produced elsewhere. A remote hit can avoid recompute,
+but its critical path includes metadata lookup, memory registration, queueing,
+RDMA transfer, destination placement, and materialization. Concurrent refill
+or migration flows can share the same links with deadline-sensitive reads.
+Consequently, more retained KV may coexist with worse request p99.
 
-This draft makes three bounded contributions.  First, it converts PegaFlow's
-cache-hit story into a request-level break-even problem that accounts for the
-entire transfer critical path.  Second, it states a phase-aware mechanism
-hypothesis whose output is falsifiable by matched lifecycle receipts.  Third,
-it defines the Ascend causal chain and the custody gate required before any
-performance result is paper-admissible.  Mechanism implementation and all new
-experiments remain the responsibility of the repository's student owners.
+Our research question is:
 
-\section{The Seven-Question Research Contract}
+\begin{quote}
+Can a disaggregated KV store jointly choose host-memory placement, remote-read
+timing, and transfer budgets so that it uses CPU memory on both P and D nodes
+without making RDMA and request tail latency unpredictable?
+\end{quote}
+
+The paper advances only if a matched real-runtime trace first shows the claimed
+counterexample: extra pooled capacity improves residency or hits while
+uncontrolled remote traffic causes a repeatable tail-latency penalty.
+
+\section{Gap and Scope}
+
+Capacity-oriented policies decide what to retain; transfer engines decide how
+to move bytes; serving schedulers decide where requests run. Treating these
+decisions independently assumes that a remote cache hit has a stable cost.
+That assumption can fail when large background movements and deadline-critical
+reads share registration resources, queues, links, or destination bandwidth.
+
+The intended contribution is not another multi-NIC routing protocol and not a
+new KV correctness protocol. PegaFlow owns object placement, read admission,
+and transfer budgeting at the cache/runtime boundary. Multi-path selection,
+connection recovery, and generation-safe object identity remain required
+components or baselines, but are outside the paper's novelty claim.
+
+\section{Seven-Question Research Contract}
 
 \begin{longtable}{>{\raggedright\arraybackslash}p{0.05\linewidth}p{0.90\linewidth}}
 \toprule
 Q & Frozen answer \\
 \midrule
-1 & \textbf{Problem.} When a request can reuse shared KV state, which workload,
-phase, and resource conditions predict that transfer will beat isolated
-recompute without reversing TTFT?  The unit is a matched request lifecycle, not
-an aggregate cache-hit ratio. \\
-2 & \textbf{Importance.} A wrong decision adds packing, DMA, queueing, and
-materialization to a request that recompute could have served sooner.  The
-failure is user-visible tail latency and resource contention, even when average
-throughput or utilization improves. \\
-3 & \textbf{Hidden assumption and related-work boundary.} Storage caches,
-generic KV connectors, and transfer engines commonly treat availability or a
-local transfer estimate as sufficient.  PegaFlow asks whether that assumption
-fails once request-level queue state, KV layout, accelerator copy semantics,
-and prefill opportunity cost interact.  It is not a new cache policy, a general
-RPC layer, or a claim that all external-KV systems lack observability. \\
-4 & \textbf{Mechanism hypothesis.} A lifecycle-bound phase model estimates
-$G=C_{\mathrm{prefill}}-(C_{\mathrm{pack}}+C_{\mathrm{queue}}+
-C_{\mathrm{transport}}+C_{\mathrm{materialize}})$ and selects a fixed shared
-path only when the lower confidence bound of $G$ clears a preregistered safety
-margin; otherwise it retains the matched isolated path.  This selector and its
-Ascend-native seam are \tbd. \\
-5 & \textbf{Feasibility.} PegaFlow already exposes connector, prefetch, DMA,
-queue, and request events and separates storage from the inference process.
-That makes a minimal receipt-bound predictor implementable at an existing seam,
-but feasibility is not evidence of accuracy or overhead. \\
-6 & \textbf{Matched evaluation.} Compare the native isolated path, the existing
-fixed PegaFlow path, and the proposed phase-aware treatment using identical
-code/runtime pins, model and input order, service lifecycle, device allocation,
-KV layout, concurrency, and graph mode.  Correctness must pass before TTFT,
-TPOT, throughput, queue time, transfer time, and utilization are analyzed. \\
-7 & \textbf{Takeaway.} A reusable result would be a predictive boundary for
-when external KV transport is beneficial, together with a causal explanation
-for latency--throughput reversal.  A negative result closes only the tested
-phase model and seam. \\
+1 & \textbf{Problem.} Jointly exploit P- and D-node CPU memory while bounding
+the tail cost of remote KV reads and background movement. \\
+2 & \textbf{Importance.} A capacity win that violates TTFT or TPOT p99 is not a
+serving win; long-context requests make both saved compute and transferred
+bytes large. \\
+3 & \textbf{Gap.} Existing capacity, placement, and transport controls do not
+necessarily expose one request-level budget that accounts for queueing,
+registration, transfer, refill, and materialization. Mooncake is a strong
+end-to-end baseline, not evidence that the problem is already solved. \\
+4 & \textbf{Idea.} Give every transferable KV object a lifecycle receipt and a
+deadline-aware transfer value. Admit remote reads and background movement under
+separate bounded budgets; place replicas according to predicted saved compute,
+reuse distance, bytes, and contention. \\
+5 & \textbf{Feasibility.} PegaFlow already exposes host backing, topology,
+leases, prefetch, read cache, RDMA, connector, and metrics seams. The first
+scope is one P/D deployment and one transfer path. \\
+6 & \textbf{Evaluation.} Freeze total CPU memory, workload, topology, runtime,
+and request order; compare local-only, static pooled memory, NUMA-aware
+placement, transfer shaping, Mooncake-compatible policy, and the joint design. \\
+7 & \textbf{Takeaway.} Distributed cache capacity must be scheduled together
+with transfer debt; the useful region is predictable from saved compute,
+reuse distance, object bytes, and deadline slack. \\
 \bottomrule
 \end{longtable}
 
-\section{Problem Model and Hidden Assumption}
-
-For request $r$, let $P_r$ be the prefill work avoided by a reusable prefix and
-let $X_r$ be the extra work introduced by external reuse.  A deployable choice
-needs more than $P_r>X_r$ in expectation: it must preserve output identity,
-respect the request and KV generation lifecycle, and meet a tail-SLO margin
-under contention.  We decompose
-\[
-X_r = X_r^{pack}+X_r^{queue}+X_r^{transport}+X_r^{materialize}
-      +X_r^{coordination}.
-\]
-The common hidden assumption is that a hit and a transfer-bandwidth estimate
-adequately approximate $X_r$.  This drops shared queue delay, topology, block
-layout conversion, graph-mode effects, and interference among copies.  It also
-mixes producer warmup with consumer evidence unless the lifecycle is explicit.
-
-PegaFlow's scope is deliberately narrower than routing or admission control.
-The proposed decision changes only whether a reusable KV object follows the
-already available shared path or the matched isolated path.  It does not choose
-which request to serve, where to route it, how to compress its state, or which
-tier should own it.
-
-\section{Architecture Causal Chain for Ascend}
-
-\paragraph{Architecture fact.}
-The repository's Ascend carrier imports NPU memory across processes, uses
-explicit host-pinned allocation and asynchronous device copies, and records a
-NUMA-sensitive transfer path.  The serving carrier uses graph-mode execution
-and a device-specific KV layout.  These are code and design facts; they do not
-alone establish a performance contribution.
-
-\paragraph{Invalidated assumption.}
-A GPU-derived rule that treats a cache hit or nominal PCIe bandwidth as a
-request-level win ignores explicit import/materialization, queue contention,
-layout-dependent bytes, and graph-mode prefill cost.  The repository's preserved
-negative examples make that assumption unsafe, but their exact numeric effects
-remain exploratory until custody closes.
-
-\paragraph{Real counterexample.}
-Tracked serving-path traces include a burst regime in which the shared path is
-worse and a compressed-KV regime near break-even.  They are real-path artifacts,
-not simulation, yet issue~18 shows that most referenced code/runtime commits are
-not durably retrievable.  We therefore use only the qualitative contradiction:
-``hit implies win'' is false in at least one recorded real path.  No number from
-those traces is a paper result in this draft.
-
-\paragraph{Native mechanism.}
-The candidate native mechanism combines lifecycle receipts with an
-Ascend-aware phase estimate at the existing connector/transfer seam.  It must
-account for copy-stream queue state, NUMA placement, materialized layout, and
-graph-mode prefill opportunity cost.  No such reviewed mechanism and matched
-result currently exist.  Accordingly, the present Ascend work is classified as
-\textbf{porting/adaptation plus a pending native hypothesis}.
-
-\paragraph{Predictive boundary.}
-The shared path should win only when reusable prefill is large enough and copy
-contention is low enough that the lower confidence bound of $G_r$ exceeds the
-safety margin for the target SLO.  Short or heavily compressed prefixes,
-bursty concurrent copies, topology mismatch, and receiver queueing predict the
-opposite outcome.
-
-\paragraph{Generalization class.}
-The boundary may generalize to heterogeneous accelerators where external state
-reuse substitutes device compute with host or fabric movement and explicit
-materialization.  It does not automatically generalize to in-device prefix
-caches or systems without lifecycle-visible transfer costs.
-
 \section{Mechanism Hypothesis}
 
-The proposed treatment has three conceptual pieces.  A \emph{receipt layer}
-binds lookup, enqueue, transfer, materialization, and completion to one request,
-KV identity, and generation.  A \emph{phase estimator} derives the expected
-saved prefill and added critical-path components from matched, causally valid
-observations.  A \emph{guarded decision} enables the shared path only when its
-confidence-aware gain clears the frozen margin and correctness is already
-qualified.
+For object $i$, the controller estimates
+\[
+V_i = C_i^{\mathrm{saved}} -
+(L_i^{\mathrm{lookup}}+L_i^{\mathrm{queue}}+L_i^{\mathrm{xfer}}+
+L_i^{\mathrm{materialize}}),
+\]
+along with bytes, expected reuse, deadline slack, source/destination pressure,
+and placement lifetime. It chooses among local retain, remote retain, replicate,
+defer, evict, or recompute. Deadline-critical reads receive a bounded foreground
+budget; refill, replication, and migration consume a separately capped
+background budget. A decision is revoked when identity, generation, topology,
+or measured queue state differs from its admission receipt.
 
-This is intentionally not an implementation specification.  Student owners
-must choose the minimal carrier seam and demonstrate that instrumentation does
-not dominate the estimated gain.  If the dominant delay is network or service
-queueing outside PegaFlow's seam, issue~4 requires transferring the question to
-the appropriate networking or scheduling project instead of expanding this
-repository.
+This is not merely rate limiting. Placement changes future traffic, while
+traffic debt changes whether a remote copy is valuable. The hypothesis predicts
+wins when reuse is high, saved prefill is large, and remote queues are
+controllable. It predicts losses for short prefixes, one-shot objects, saturated
+links, inaccurate reuse estimates, or materialization-dominated paths.
 
 \section{Current Evidence Ledger}
 
-Table~\ref{tab:evidence} separates execution class from paper admissibility.
-``Real path'' never overrides missing provenance.
+The repository preserves real-online trace families and a portable trace-audit
+harness. Issue 18 records that most historical referenced commits were not
+reachable from durable refs at review time. Those artifacts remain exploratory:
+they may select variables and failure cases, but no numeric result enters this
+paper. Simulation and host probes qualify interfaces only.
 
-\begin{table}[ht]
+\begin{table}[h]
 \centering
-\small
-\begin{tabular}{>{\raggedright\arraybackslash}p{0.22\linewidth}
-                >{\raggedright\arraybackslash}p{0.18\linewidth}
-                >{\raggedright\arraybackslash}p{0.49\linewidth}}
+\caption{Evidence boundary before the new matched run.}
+\begin{tabular}{p{0.27\linewidth}p{0.25\linewidth}p{0.39\linewidth}}
 \toprule
-Artifact family & Evidence label & Paper boundary \\
+Artifact & Class & Admissible use \\
 \midrule
-Trace-audit family & real-online trace, exploratory & Contains
-request and transfer events, including negative examples.  Historical
-code/runtime custody is incomplete; no numeric claim is admitted. \\
-Performance T1--T5 family & real-online trace audit, exploratory & Some
-audit manifests declare valid event conservation, while other runs fail closed.
-Issue~18 blocks formal use until referenced PegaFlow, vLLM, and Ascend commits
-and raw-log custody are durable. \\
-Archived benchmark report & derived narrative & Historical
-summary only; it is not raw evidence and cannot support a result. \\
-Trace preregistration & contract & Defines matched arms,
-oracles, and stop rules; it is not an experiment result. \\
-Host and simulation tests & probe/simulation & Qualify local semantics only;
-they cannot establish serving, NPU, or end-to-end effects. \\
-Future matched matrix & \tbd & Requires durable carrier/runtime pins, raw
-receipts, allocation identity, oracle closure, and an exact result manifest. \\
+Historical serving traces & exploratory real-online & variable selection; no number \\
+Trace preregistration & contract & matched-arm definition \\
+Host/simulation tests & qualification & semantics only \\
+P/D RDMA tail counterexample & absent & no pathology claim \\
+Joint policy result & absent & no benefit claim \\
 \bottomrule
 \end{tabular}
-\caption{Fail-closed evidence classification.}
-\label{tab:evidence}
 \end{table}
 
-\section{Evaluation Contract}
+\section{Matched Evaluation Contract}
 
-\subsection{Arms and matching}
+\paragraph{Trace schema.}
+Each object records producer, consumer, model/request/generation identity,
+bytes, source and destination tier, creation, lookup, queue, transfer,
+materialization, hit/miss, reuse distance, deadline, cancellation, and cleanup.
+NIC/link and NUMA identities must be tied to the request receipt.
 
-The strongest deployable baseline is the native isolated namespace under the
-same runtime and graph mode.  The second baseline is fixed PegaFlow sharing with
-no state-aware selection.  The treatment is the proposed phase-aware guarded
-path.  Each comparison freezes the PegaFlow and runtime heads, official carrier
-identity, dependency lock, model and configuration hash, prompt order, request
-arrival trace, producer/consumer lifecycle, block layout, service flags, device
-allocation, clock source, and fault/interference schedule.  Arm order alternates
-and the unit of replication is an independent service lifecycle.
+\paragraph{Arms.}
+Under identical model, requests, P/D counts, total CPU-memory bytes, topology,
+and network conditions, compare: decode-local only; static use of both host
+pools; NUMA-aware static placement; bounded-concurrency or priority shaping;
+a deployable Mooncake-style baseline; and joint placement plus transfer budget.
 
-\subsection{Correctness oracle}
+\paragraph{Metrics.}
+Report at least ten independent starts and full distributions for RDMA queue
+delay, flow concurrency, bytes, useful bandwidth, cache hit, effective
+residence time, TTFT, TPOT, throughput, recompute, recovery, and memory overhead.
+All arms require completion, output, object identity, generation, cleanup, and
+capacity conservation oracles.
 
-Every consumer request must match the isolated baseline's token IDs under the
-repository's accepted tolerance.  Receipt conservation must report exactly one
-eligible connector event, prefetch decision, transfer completion when required,
-and materialization completion per request/KV generation.  Missing, duplicate,
-orphan, cross-arm, cross-request, or fallback-only transfer evidence invalidates
-the lifecycle.  Producer warmup is excluded from the consumer comparison.
+\paragraph{Success gate.}
+The primary gate is a preregistered reduction in RDMA and request p99 relative
+to the strongest deployable baseline at unchanged total CPU memory and
+non-inferior cache hit. Baseline repeats must freeze the numerical margin before
+treatment data are inspected. A 50\% increase in effective cache residence is
+reported only as a secondary capacity benefit and cannot compensate for worse
+tail latency.
 
-\subsection{Metrics and preregistered gates}
+\section{Stopping Rules and Claim Discipline}
 
-Report full distributions of TTFT, TPOT, total latency, request throughput,
-queue time, transfer time and bytes, cache-hit coverage, and accelerator/host
-utilization.  The treatment may advance only if correctness is 100\%, every
-claim-bearing lifecycle has complete receipts, and it beats both deployable
-baselines without a preregistered unacceptable TTFT or TPOT regression.  Exact
-numeric performance thresholds remain \tbd{} until owners freeze the target SLO
-before observing the new matrix; this draft does not invent them.
+Stop the joint mechanism if matched real traces do not show an uncontrolled
+traffic tail, if static placement or simple shaping reaches the oracle, or if
+remote reads cannot beat recompute in the tested regime. Close only that
+mechanism and retain the correctness carrier.
 
-\subsection{Stop conditions}
-
-Stop after one bounded correctness-debug cycle if conservation or output
-identity still fails.  Stop the selector hypothesis if its lower-bound decision
-does not repeatedly separate winning and losing regimes, if oracle headroom
-over the strongest fixed arm is absent, or if receipt overhead consumes the
-predicted gain.  Stop the Ascend-native claim if only API adaptation, packaging,
-or environment wiring differs from the generic path.  Negative outcomes close
-only the tested model and seam; thresholds must not be moved after held-out
-results are visible.
-
-\section{Related-Work Boundary}
-
-PagedAttention establishes block-granular KV-cache management inside an LLM
-serving engine~\cite{kwon2023pagedattention}, while Mooncake makes KV state a
-disaggregated serving resource and reports the storage--computation tradeoff of
-moving it across a KV-centric data path~\cite{qin2025mooncake}.  These systems
-motivate, but do not themselves establish, PegaFlow's proposed receipt-bound
-break-even predictor.  Prefix caches establish reuse within an engine; generic
-transfer engines optimize bytes, registration, and fabric movement; queueing
-and SLO controllers choose request-level service actions.
-PegaFlow's proposed paper boundary is the intersection: predicting a
-request-level reuse break-even from lifecycle-bound transfer phases in an
-existing sidecar data path.  A later related-work pass must add only verified
-references and must narrow the novelty claim if any prior system already makes
-the same receipt-bound prediction.
-
-\section{Limitations and Two-Week Deliverable}
-
-No result in this draft is paper-admissible.  Historical runtime refs are
-incomplete, existing artifacts span multiple experimental revisions, and the
-native Ascend mechanism is unimplemented.  The first week should close a
-claim-bearing artifact inventory and durable code/runtime refs, then freeze the
-minimal seam, receipts, baselines, and thresholds.  The second week should
-produce host-level oracle tests and, only after independent allocation, one
-matched real-path pilot.  The student owners perform all implementation,
-environment setup, execution, debugging, and result generation.
+The present Ascend code establishes a porting/adaptation seam, not an
+architecture-native contribution. An Ascend claim requires documented runtime
+or memory behavior, a matched counterexample on 910B2, a native response, and a
+predictive boundary. Host replay does not establish RDMA or serving benefit.
 
 \section{Conclusion}
 
-PegaFlow already demonstrates a substantial external-KV system carrier, but its
-research claim must be narrower than ``cache sharing is faster.''  The
-falsifiable opportunity is to predict the request-level break-even between
-saved prefill and the full transfer critical path.  Until provenance custody,
-the native mechanism, and matched evaluation close, this remains a
-well-specified hypothesis with exploratory evidence rather than a completed
-systems result.
+PegaFlow's paper question is not whether unused host memory can hold more KV.
+It is whether distributed capacity can be made useful without importing
+unbounded transfer debt into the request critical path. The next decisive
+artifact is therefore a custody-complete P/D trace that jointly exposes
+residency and tail cost, followed by the frozen matched comparison above.
 
 \bibliographystyle{plain}
 \bibliography{references}
-
 \end{document}

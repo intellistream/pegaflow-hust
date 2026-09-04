@@ -26,3 +26,13 @@ raw logs and hashes are present, execution commands are portable, lifecycle
 receipts conserve identity, output correctness is 100%, and the result is
 mapped to a preregistered baseline/treatment comparison. Invalid and negative
 artifacts stay visible and close only the tested mechanism and regime.
+
+## September 2026 storyline gate
+
+Issue #23 narrows the next paper-bearing question to joint P/D host-memory
+placement and RDMA-tail control. No existing artifact is treated as evidence
+that unordered or bursty RDMA traffic causes request p99 inflation. The next
+admissible result must bind object-level lifecycle and transfer receipts to the
+same request-level TTFT/TPOT observations under fixed total CPU-memory capacity.
+Effective TTL is derived from actual residency; a configured TTL is not a
+result.

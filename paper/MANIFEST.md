@@ -1,23 +1,22 @@
 # PegaFlow paper artifact manifest
 
-- Status: advisor-authored storyline draft; implementation and experiments remain student-owned.
+- Repository: `vLLM-HUST/pegaflow-hust`.
+- Status: advisor-authored storyline draft on the existing Draft PR; implementation and experiments remain student-owned.
 - Source base: `1c9f1fc48c1239a8f8813056aba6b6696ba41fe7` (`origin/main`).
-- Artifact commit: `1a5b4a6290341cdda49979f91397319d0a5a7afe`.
-- Binding rule: this metadata-only commit immediately follows the artifact commit above; the recorded TeX, PDF, and transcript hashes bind the reviewed bytes without a self-referential commit hash.
 - TeX entrypoint: `paper/main.tex`.
-- Bibliography: `paper/references.bib` (2 verified primary-source entries, both cited in the paper).
+- Bibliography: `paper/references.bib`; primary-source system references are cited in the paper.
 - Evidence ledger: `paper/EVIDENCE_LEDGER.md`.
-- Build command: `make -C paper TECTONIC=/home/shuhao/.conda/envs/neuromem/bin/tectonic`.
-- Tectonic exit code: `0`.
-- PDF: `paper/build/main.pdf`.
-- Full transcript: `paper/build/tectonic.log`.
-- PDF pages: `5`.
-- Visual inspection: all five pages rendered with `pdftoppm -png -r 70` and inspected individually; no clipping, overlap, accidental blank page, or unreadable table was found.
-- Build-log scan: no missing characters, undefined references, underfull boxes, overfull boxes, or Tectonic warnings.
-- `main.tex` SHA256: `f4f7eed9f66421ed30fe513f1cf8ab2269c2f5f7432c4cb0c2cbf75e539e4555`.
-- `references.bib` SHA256: `95f854f2b071b7601d377bc9134caea5ca6cb3cf74d7e127dbf9448c261b9349`.
-- `main.pdf` SHA256: `841958e731fe60134a694ec45b836b09429a7478811aa7a59134464da1bd5813`.
-- `tectonic.log` SHA256: `fcdd92f990e2e2c075334698bc8de349d801078d733818b20be0036ca5f17adf`.
-- Host-only validation: `19 passed` from `python -m pytest -q test_trace_audit_dryrun.py`; `git diff --check` passed.
-- Highest current evidence: exploratory real-online serving-path trace; not paper-admissible because historical code/runtime custody is incomplete.
-- Open evidence gates: durable carrier/runtime refs, formal artifact inventory, reviewed native mechanism, frozen SLO thresholds, and a new matched oracle-closed run.
+- PDF: `paper/build/main.pdf`; 3 pages.
+- Build transcript: `paper/build/tectonic.log`; Tectonic exit code 0.
+- Build-log scan: no overfull box, undefined reference, missing-character, or TeX error.
+- Visual inspection: all three pages rendered and inspected; no clipping, overlap, blank page, or unreadable element.
+- `main.tex` SHA256: `065BA014547661089B3E0F19997FBBCDC9865E7A061E5BF02D3FF52280D0C86D`.
+- `references.bib` SHA256: `001C75DC8A206BC5164E7D020BAF9CA1AC44A82C1A6FBA67024780425677C6A7`.
+- `EVIDENCE_LEDGER.md` SHA256: `27B381A8D025E47D1B515D9AD02602453069E7B6FB81541AA8FA28456A82AEF6`.
+- `main.pdf` SHA256: `7EABD2B1BE08CEBBE1699EDBA873903E64F65F144B16639ECCA831D5953E6447`.
+- `tectonic.log` SHA256: `AD12D5B4A9E94833655E45AE7AC3FDC3D1FEC936E90B9D4A2FD00EEC90E009FA`.
+- Validation: paper build and `git diff --check`; code behavior is unchanged.
+
+## Evidence boundary
+
+Existing traces motivate measurement but do not yet establish that pooled P/D host memory causes uncontrolled RDMA tails. The paper therefore gates the mechanism on a fresh matched necessity experiment. Its primary claim is tail predictability at fixed total CPU memory and non-inferior cache hit rate; a 50% increase in effective residence is secondary and cannot substitute for the p99 result.

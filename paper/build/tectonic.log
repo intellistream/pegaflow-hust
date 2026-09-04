@@ -1,11 +1,22 @@
 note: Running TeX ...
+note: downloading article.cls
+Fontconfig error: Cannot load default config file: No such file: (null)
+note: downloading longtable.sty
+note: downloading lmroman17-regular.otf
+note: downloading lmroman12-regular.otf
+note: downloading mt-cmr.cfg
+note: downloading lmroman12-bold.otf
 note: Running BibTeX on main.aux ...
+note: downloading plain.bst
 note: Rerunning TeX because bibtex was run ...
+note: downloading lmroman10-italic.otf
 note: Rerunning TeX because "main.aux" changed ...
 note: Running xdvipdfmx ...
-note: Writing `build/main.aux` (3.392578125 KiB)
-note: Writing `build/main.log` (12.5439453125 KiB)
-note: Writing `build/main.bbl` (734 B)
-note: Writing `build/main.blg` (191 B)
-note: Writing `build/main.pdf` (72.310546875 KiB)
-note: Writing `build/main.out` (2.3310546875 KiB)
+note: downloading cmmi7.pfb
+note: downloading cmr7.pfb
+note: Writing `build\main.log` (11.58203125 KiB)
+note: Writing `build\main.pdf` (58.943359375 KiB)
+note: Writing `build\main.blg` (191 B)
+note: Writing `build\main.bbl` (734 B)
+note: Writing `build\main.aux` (2.337890625 KiB)
+note: Writing `build\main.out` (1.330078125 KiB)
