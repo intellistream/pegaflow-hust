@@ -36,3 +36,7 @@ admissible result must bind object-level lifecycle and transfer receipts to the
 same request-level TTFT/TPOT observations under fixed total CPU-memory capacity.
 Effective TTL is derived from actual residency; a configured TTL is not a
 result.
+SYMPHONY is a required disaggregated-memory baseline. Before treatment, the
+protocol freezes a 20% RDMA queue-delay p99 reduction, a 10% TTFT p99
+reduction, one-percentage-point cache-hit non-inferiority margin, 5% throughput
+non-inferiority margin, and request-stratified bootstrap confidence procedure.

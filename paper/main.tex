@@ -38,6 +38,9 @@ concerns~\cite{kwon2023pagedattention}. Systems such as Mooncake go further by
 using CPU memory, SSD, and NIC resources across disaggregated prefill and decode
 clusters~\cite{qin2025mooncake}. This creates a stronger baseline than
 decode-local caching: both sides' memory can contribute to a distributed pool.
+SYMPHONY additionally moves KV through a disaggregated memory layer using
+advisory requests and cooperative cache management~\cite{agarwal2026symphony}.
+It is therefore a required end-to-end baseline, not merely related work.
 
 The representative setting is long-context P/D serving in which a decode node
 frequently consumes KV produced elsewhere. A remote hit can avoid recompute,
@@ -68,8 +71,11 @@ reads share registration resources, queues, links, or destination bandwidth.
 
 The intended contribution is not another multi-NIC routing protocol and not a
 new KV correctness protocol. PegaFlow owns object placement, read admission,
-and transfer budgeting at the cache/runtime boundary. Multi-path selection,
-connection recovery, and generation-safe object identity remain required
+and transfer budgeting at the cache/runtime boundary. Relative to SYMPHONY, the
+claimed gap is narrower: whether one request-level receipt can expose and bound
+the transfer debt jointly created by remote hits and background movement across
+both P- and D-node host pools. Multi-path selection, connection recovery, and
+generation-safe object identity remain required
 components or baselines, but are outside the paper's novelty claim.
 
 \section{Seven-Question Research Contract}
@@ -170,10 +176,15 @@ All arms require completion, output, object identity, generation, cleanup, and
 capacity conservation oracles.
 
 \paragraph{Success gate.}
-The primary gate is a preregistered reduction in RDMA and request p99 relative
-to the strongest deployable baseline at unchanged total CPU memory and
-non-inferior cache hit. Baseline repeats must freeze the numerical margin before
-treatment data are inspected. A 50\% increase in effective cache residence is
+The primary gate requires at least a 20\% reduction in RDMA queue-delay p99 and
+at least a 10\% reduction in request TTFT p99 relative to the strongest
+deployable baseline, at unchanged total CPU memory. For each ratio, a
+request-level stratified bootstrap over independent runs must place the upper
+endpoint of the 95\% confidence interval below $0.90$ and $0.95$,
+respectively. Cache hit may fall by at most one absolute percentage point and
+throughput by at most 5\%; their one-sided 95\% confidence bounds must remain
+inside those margins. These statistics and strata are frozen from baseline-only
+pilots before treatment is run. A 50\% increase in effective cache residence is
 reported only as a secondary capacity benefit and cannot compensate for worse
 tail latency.
 
