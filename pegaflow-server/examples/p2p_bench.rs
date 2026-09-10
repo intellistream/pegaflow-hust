@@ -159,6 +159,11 @@ struct Cli {
     #[arg(long)]
     use_hugepages: bool,
 
+    /// Use one pinned CPU pool instead of auto-creating pools for every
+    /// accelerator NUMA node visible in host topology discovery.
+    #[arg(long)]
+    disable_numa_affinity: bool,
+
     /// Requester: load every fetched block to GPU and verify every byte.
     #[arg(long)]
     verify: bool,
@@ -572,6 +577,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, devices: &[usize], pool_bytes: usi
         advertise_addr: Some(format!("{}:{}", cli.advertise_ip, cli.port)),
         rdma_nic_names: nic_config(cli),
         max_prefetch_blocks: shape.blocks + 100,
+        enable_numa_affinity: !cli.disable_numa_affinity,
         ..StorageConfig::default()
     };
     let engine = Arc::new(
@@ -681,6 +687,7 @@ async fn run_requester(cli: &Cli, shape: &Shape, devices: &[usize], pool_bytes: 
         advertise_addr: Some(format!("{}:{}", cli.advertise_ip, cli.port)),
         rdma_nic_names: nic_config(cli),
         max_prefetch_blocks: shape.blocks + 100,
+        enable_numa_affinity: !cli.disable_numa_affinity,
         ..StorageConfig::default()
     };
     let engine = Arc::new(
@@ -855,7 +862,7 @@ async fn main() {
     };
     info!(
         "p2p_bench role={:?} model={:?} layers={} tp={} devices={devices:?} blocks={} sets={} \
-         set_bytes={:.1}MiB pool={:.1}GiB page_first={} mla_replica={}",
+         set_bytes={:.1}MiB pool={:.1}GiB page_first={} mla_replica={} numa_affinity={}",
         cli.role,
         cli.model,
         shape.num_layers(),
@@ -866,6 +873,7 @@ async fn main() {
         pool_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         cli.page_first,
         cli.mla_replica,
+        !cli.disable_numa_affinity,
     );
 
     match cli.role {
