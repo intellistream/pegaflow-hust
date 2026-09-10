@@ -147,6 +147,8 @@ pub(crate) struct PinnedMemory {
     device_ptr: NonNull<u8>,
     size: usize,
     strategy: AllocStrategy,
+    #[cfg(feature = "ascend")]
+    ascend_registered_device: Option<i32>,
 }
 
 impl std::fmt::Debug for PinnedMemory {
@@ -209,6 +211,8 @@ impl PinnedMemory {
             device_ptr,
             size,
             strategy: AllocStrategy::CudaHostAlloc,
+            #[cfg(feature = "ascend")]
+            ascend_registered_device: None,
         })
     }
 
@@ -253,6 +257,7 @@ impl PinnedMemory {
             device_ptr,
             size,
             strategy: AllocStrategy::AscendHostAlloc,
+            ascend_registered_device: None,
         })
     }
 
@@ -300,6 +305,7 @@ impl PinnedMemory {
                 .expect("aclrtHostRegister returned null device pointer"),
             size,
             strategy: AllocStrategy::AscendHostRegister,
+            ascend_registered_device: Some(device_id),
         })
     }
 
@@ -374,6 +380,8 @@ impl PinnedMemory {
             device_ptr,
             size: aligned_size,
             strategy,
+            #[cfg(feature = "ascend")]
+            ascend_registered_device: None,
         })
     }
 
@@ -458,7 +466,10 @@ impl Drop for PinnedMemory {
                 #[cfg(feature = "ascend")]
                 {
                     use crate::device::ascend;
-                    if let Err(e) = ascend::unregister_host(self.ptr.as_ptr()) {
+                    let device_id = self
+                        .ascend_registered_device
+                        .expect("Ascend registered host allocation lost its device ID");
+                    if let Err(e) = ascend::unregister_host(device_id, self.ptr.as_ptr()) {
                         eprintln!("Warning: aclrtHostUnregister failed: {e}");
                     }
                 }

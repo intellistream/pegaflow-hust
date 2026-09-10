@@ -155,7 +155,7 @@ fn ascend_registered_host_memcpy_roundtrip_4096() {
 
     drop(stream);
     ascend::free_device(dev_ptr).expect("aclrtFree");
-    ascend::unregister_host(host_ptr).expect("aclrtHostUnregister");
+    ascend::unregister_host(0, host_ptr).expect("aclrtHostUnregister");
     let rc = unsafe { libc::munmap(host_ptr.cast(), SIZE) };
     assert_eq!(rc, 0, "munmap failed");
     drop(device);

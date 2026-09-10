@@ -44,7 +44,15 @@ fn ascend_registered_host_is_rdma_registerable() {
         .expect("ibv_reg_mr for aclrtHostRegister mapping");
     engine.unregister_memory(&[ptr]).expect("unregister MR");
 
-    ascend::unregister_host(host).expect("aclrtHostUnregister");
+    // Engine pools are reference-counted and may be destroyed by a worker
+    // thread with no current ACL device. Exercise that exact cleanup path.
+    let host_addr = host as usize;
+    std::thread::spawn(move || {
+        ascend::unregister_host(0, host_addr as *mut u8)
+            .expect("aclrtHostUnregister on a fresh thread");
+    })
+    .join()
+    .expect("cleanup thread panicked");
     assert_eq!(unsafe { libc::munmap(host.cast(), SIZE) }, 0);
     drop(device);
 }

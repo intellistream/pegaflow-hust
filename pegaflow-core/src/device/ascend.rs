@@ -500,10 +500,20 @@ pub fn register_host(device_id: i32, ptr: *mut u8, size: usize) -> Result<*mut u
 }
 
 /// Unregister host memory previously registered by [`register_host`].
-pub fn unregister_host(ptr: *mut u8) -> Result<(), String> {
+///
+/// Pool ownership can move across threads, and ACL device context is
+/// thread-local. Restore the registration device before unregistering so a
+/// pool dropped by a worker thread does not fail with `ACL_ERROR_RT_CONTEXT_NULL`.
+pub fn unregister_host(device_id: i32, ptr: *mut u8) -> Result<(), String> {
     ensure_acl_initialized()?;
     if ptr.is_null() {
         return Err("aclrtHostUnregister: ptr must not be null".into());
+    }
+    let ret = unsafe { aclrtSetDevice(device_id) };
+    if ret != ACL_ERROR_NONE {
+        return Err(format!(
+            "aclrtSetDevice({device_id}) before unregister_host failed: error code {ret}"
+        ));
     }
     let ret = unsafe { aclrtHostUnregister(ptr as *mut c_void) };
     if ret != ACL_ERROR_NONE {
