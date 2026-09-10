@@ -58,6 +58,9 @@ const ACL_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 const ACL_MEM_LOCATION_TYPE_HOST: i32 = 0;
 const ACL_MEM_LOCATION_TYPE_DEVICE: i32 = 1;
 
+/// Map an existing host allocation into the current Ascend device context.
+const ACL_HOST_REGISTER_MAPPED: i32 = 0;
+
 // Configure the 64-byte alignment requirement for Ascend pinned memory.
 pub(crate) const ASCEND_HOST_ALIGNMENT: usize = 64;
 
@@ -113,6 +116,17 @@ unsafe extern "C" {
 
     /// Free pinned host memory.
     fn aclrtFreeHost(ptr: *mut c_void) -> aclError;
+
+    /// Page-lock and map an existing host allocation into device address space.
+    fn aclrtHostRegister(
+        ptr: *mut c_void,
+        size: u64,
+        register_type: i32,
+        device_ptr: *mut *mut c_void,
+    ) -> aclError;
+
+    /// Unregister host memory previously registered by `aclrtHostRegister`.
+    fn aclrtHostUnregister(ptr: *mut c_void) -> aclError;
 
     /// Batched asynchronous memory copy (CANN 8.5+).
     /// Transfers multiple discontiguous regions in a single call,
@@ -442,6 +456,58 @@ pub fn free_host(ptr: *mut u8) -> Result<(), String> {
     let ret = unsafe { aclrtFreeHost(ptr as *mut c_void) };
     if ret != ACL_ERROR_NONE {
         return Err(format!("aclrtFreeHost failed: error code {ret}"));
+    }
+    Ok(())
+}
+
+/// Page-lock and map an existing host allocation for Ascend DMA.
+///
+/// Unlike `aclrtMallocHost`, the caller owns the allocation. This path is
+/// suitable for host pages that must also be registered with an RDMA HCA.
+pub fn register_host(device_id: i32, ptr: *mut u8, size: usize) -> Result<*mut u8, String> {
+    ensure_acl_initialized()?;
+    if ptr.is_null() {
+        return Err("aclrtHostRegister: ptr must not be null".into());
+    }
+    if size == 0 {
+        return Err("aclrtHostRegister: size must be > 0".into());
+    }
+    let ret = unsafe { aclrtSetDevice(device_id) };
+    if ret != ACL_ERROR_NONE {
+        return Err(format!(
+            "aclrtSetDevice({device_id}) before register_host({size}) failed: error code {ret}"
+        ));
+    }
+    let mut device_ptr: *mut c_void = std::ptr::null_mut();
+    let ret = unsafe {
+        aclrtHostRegister(
+            ptr as *mut c_void,
+            size as u64,
+            ACL_HOST_REGISTER_MAPPED,
+            &mut device_ptr,
+        )
+    };
+    if ret != ACL_ERROR_NONE {
+        return Err(format!(
+            "aclrtHostRegister({size}) failed: error code {ret}"
+        ));
+    }
+    if device_ptr.is_null() {
+        let _ = unsafe { aclrtHostUnregister(ptr as *mut c_void) };
+        return Err("aclrtHostRegister returned null device pointer".into());
+    }
+    Ok(device_ptr as *mut u8)
+}
+
+/// Unregister host memory previously registered by [`register_host`].
+pub fn unregister_host(ptr: *mut u8) -> Result<(), String> {
+    ensure_acl_initialized()?;
+    if ptr.is_null() {
+        return Err("aclrtHostUnregister: ptr must not be null".into());
+    }
+    let ret = unsafe { aclrtHostUnregister(ptr as *mut c_void) };
+    if ret != ACL_ERROR_NONE {
+        return Err(format!("aclrtHostUnregister failed: error code {ret}"));
     }
     Ok(())
 }

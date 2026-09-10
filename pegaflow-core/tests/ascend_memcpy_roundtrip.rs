@@ -94,6 +94,73 @@ fn ascend_memcpy_d2h_h2d_roundtrip_4096() {
     println!("PASS: ascend_memcpy_d2h_h2d_roundtrip_4096");
 }
 
+/// Verify that mmap + aclrtHostRegister memory works with the same batched
+/// transfer backend used by PegaFlow while remaining an ordinary host mapping
+/// suitable for `ibv_reg_mr`.
+#[test]
+fn ascend_registered_host_memcpy_roundtrip_4096() {
+    use std::sync::Arc;
+
+    use pegaflow_core::device::DeviceStream;
+    use pegaflow_core::transfer::{AscendMemcpyBackend, CopyDesc, TransferBackend};
+
+    let device = match try_init_device0() {
+        Ok(device) => device,
+        Err(e) => {
+            eprintln!("SKIP: cannot init Ascend device 0: {e}");
+            return;
+        }
+    };
+
+    const SIZE: usize = 4096;
+    let host_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(host_ptr, libc::MAP_FAILED, "mmap failed");
+    let host_ptr = host_ptr.cast::<u8>();
+    let host_device = ascend::register_host(0, host_ptr, SIZE).expect("aclrtHostRegister");
+    let dev_ptr = ascend::malloc_device(SIZE, 0).expect("aclrtMalloc");
+    let stream = Arc::new(DeviceStream::Ascend(
+        device.create_stream().expect("create stream"),
+    ));
+    let desc = CopyDesc {
+        device: dev_ptr,
+        host: host_ptr,
+        host_device: host_device as u64,
+        size: SIZE,
+    };
+    let backend = AscendMemcpyBackend::new(0);
+
+    let expected: Vec<u8> = (0..SIZE).map(|i| (i as u8).wrapping_mul(17)).collect();
+    ascend::memcpy_h2d_sync(dev_ptr, expected.as_ptr(), SIZE).expect("seed device memory");
+    backend.d2h(&[desc], &stream).expect("registered-host D2H");
+    stream.synchronize().expect("sync D2H");
+    let host = unsafe { std::slice::from_raw_parts(host_ptr, SIZE) };
+    assert_eq!(host, expected, "registered-host D2H mismatch");
+
+    let zeros = vec![0u8; SIZE];
+    ascend::memcpy_h2d_sync(dev_ptr, zeros.as_ptr(), SIZE).expect("zero device memory");
+    backend.h2d(&[desc], &stream).expect("registered-host H2D");
+    stream.synchronize().expect("sync H2D");
+    let mut observed = vec![0u8; SIZE];
+    ascend::memcpy_d2h_sync(observed.as_mut_ptr(), dev_ptr, SIZE).expect("read device memory");
+    assert_eq!(observed, expected, "registered-host H2D mismatch");
+
+    drop(stream);
+    ascend::free_device(dev_ptr).expect("aclrtFree");
+    ascend::unregister_host(host_ptr).expect("aclrtHostUnregister");
+    let rc = unsafe { libc::munmap(host_ptr.cast(), SIZE) };
+    assert_eq!(rc, 0, "munmap failed");
+    drop(device);
+}
+
 /// Stress test: repeat small-block D2H→H2D roundtrip 10,000 times.
 /// This exercises memory-allocation paths and validates no leaks.
 #[test]

@@ -45,7 +45,10 @@ impl TransferBackend for AscendMemcpyBackend {
             .map(|c| ascend::BatchCopyDesc {
                 dst: c.device,
                 dst_max: c.size,
-                src: c.host_device,
+                // ACL memcpy classifies this endpoint as host memory and
+                // requires the host VA, not the mapped device alias returned
+                // by aclrtHostRegister.
+                src: c.host as u64,
                 size: c.size,
             })
             .collect();
@@ -65,7 +68,8 @@ impl TransferBackend for AscendMemcpyBackend {
         let batch: Vec<ascend::BatchCopyDesc> = copies
             .iter()
             .map(|c| ascend::BatchCopyDesc {
-                dst: c.host_device,
+                // See h2d: ACL's host endpoint takes the host VA.
+                dst: c.host as u64,
                 dst_max: c.size,
                 src: c.device,
                 size: c.size,

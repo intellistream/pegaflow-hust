@@ -1,6 +1,6 @@
 //! Low-level pinned memory allocation for CUDA and Ascend.
 //!
-//! Three strategies for CUDA, plus one for Ascend:
+//! Three strategies for CUDA, plus two for Ascend:
 //!
 //! 1. **Regular** (`allocate_regular`): lazy `mmap` + parallel page pre-touch +
 //!    mapped `cudaHostRegister`. Each touch thread is pinned to the target NUMA
@@ -20,6 +20,10 @@
 //! 4. **AscendHostAlloc** (`allocate_ascend_host`): `aclrtMallocHost` with
 //!    64-byte alignment. Returns host + device pointers in a single allocation.
 //!    Requires `feature = "ascend"`.
+//!
+//! 5. **AscendHostRegister** (`allocate_ascend_registered`): NUMA-first-touched
+//!    anonymous memory mapped into the NPU with `aclrtHostRegister`. Unlike
+//!    `aclrtMallocHost`, these host pages can also be registered as an RDMA MR.
 //!
 //! See `examples/pinned_alloc_parallel.rs` for the benchmarks motivating the
 //! parallel pre-touch path.
@@ -82,6 +86,9 @@ pub(crate) enum PinnedMemError {
     /// aclrtMallocHost failed
     #[cfg(feature = "ascend")]
     AscendAllocFailed(String),
+    /// aclrtHostRegister failed
+    #[cfg(feature = "ascend")]
+    AscendRegisterFailed(String),
     /// Size must be greater than zero
     ZeroSize,
     /// Failed to determine huge page size from /proc/meminfo
@@ -102,6 +109,8 @@ impl std::fmt::Display for PinnedMemError {
             }
             #[cfg(feature = "ascend")]
             Self::AscendAllocFailed(e) => write!(f, "aclrtMallocHost failed: {e}"),
+            #[cfg(feature = "ascend")]
+            Self::AscendRegisterFailed(e) => write!(f, "aclrtHostRegister failed: {e}"),
             Self::ZeroSize => write!(f, "size must be greater than zero"),
             Self::HugePageSizeUnavailable => write!(
                 f,
@@ -126,6 +135,8 @@ pub(crate) enum AllocStrategy {
     HugePages,
     /// Ascend `aclrtMallocHost` with 64-byte alignment.
     AscendHostAlloc,
+    /// `mmap` + NUMA first-touch + mapped `aclrtHostRegister`.
+    AscendHostRegister,
 }
 
 /// RAII wrapper for CUDA pinned memory.
@@ -245,6 +256,53 @@ impl PinnedMemory {
         })
     }
 
+    /// Allocate ordinary anonymous host pages and map them for Ascend DMA.
+    ///
+    /// The resulting host range is compatible with both `aclrtMemcpy*` and
+    /// `ibv_reg_mr`; `aclrtMallocHost` allocations return EFAULT from
+    /// `ibv_reg_mr` on the target Ascend/RoCE platform.
+    #[cfg(feature = "ascend")]
+    pub(crate) fn allocate_ascend_registered(
+        device_id: i32,
+        size: usize,
+        node: NumaNode,
+    ) -> Result<Self, PinnedMemError> {
+        if size == 0 {
+            return Err(PinnedMemError::ZeroSize);
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(PinnedMemError::MmapFailed(io::Error::last_os_error()));
+        }
+
+        parallel_pre_touch(ptr.cast::<u8>(), size, node);
+        let device_ptr =
+            match crate::device::ascend::register_host(device_id, ptr.cast::<u8>(), size) {
+                Ok(device_ptr) => device_ptr,
+                Err(err) => {
+                    unsafe { libc::munmap(ptr, size) };
+                    return Err(PinnedMemError::AscendRegisterFailed(err));
+                }
+            };
+
+        Ok(Self {
+            ptr: NonNull::new(ptr.cast::<u8>()).expect("mmap returned null"),
+            device_ptr: NonNull::new(device_ptr)
+                .expect("aclrtHostRegister returned null device pointer"),
+            size,
+            strategy: AllocStrategy::AscendHostRegister,
+        })
+    }
+
     #[cfg(feature = "cuda")]
     fn allocate_mmap_register(
         size: usize,
@@ -266,7 +324,9 @@ impl PinnedMemory {
                 )
             }
             AllocStrategy::Regular => (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, size),
-            AllocStrategy::CudaHostAlloc | AllocStrategy::AscendHostAlloc => {
+            AllocStrategy::CudaHostAlloc
+            | AllocStrategy::AscendHostAlloc
+            | AllocStrategy::AscendHostRegister => {
                 unreachable!("{:?} does not use the mmap path", strategy)
             }
         };
@@ -392,6 +452,20 @@ impl Drop for PinnedMemory {
                     if let Err(e) = ascend::free_host(self.ptr.as_ptr()) {
                         eprintln!("Warning: aclrtFreeHost failed: {}", e);
                     }
+                }
+            }
+            AllocStrategy::AscendHostRegister => {
+                #[cfg(feature = "ascend")]
+                {
+                    use crate::device::ascend;
+                    if let Err(e) = ascend::unregister_host(self.ptr.as_ptr()) {
+                        eprintln!("Warning: aclrtHostUnregister failed: {e}");
+                    }
+                }
+                let unmap =
+                    unsafe { libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size) };
+                if unmap == -1 {
+                    eprintln!("Warning: munmap failed: {}", io::Error::last_os_error());
                 }
             }
         }
@@ -523,6 +597,8 @@ mod tests {
     fn test_ascend_strategy_is_defined() {
         let strategy = AllocStrategy::AscendHostAlloc;
         assert_eq!(format!("{:?}", strategy), "AscendHostAlloc");
+        let strategy = AllocStrategy::AscendHostRegister;
+        assert_eq!(format!("{:?}", strategy), "AscendHostRegister");
     }
 
     #[cfg(feature = "ascend")]
@@ -567,5 +643,30 @@ mod tests {
     fn test_allocate_ascend_host_zero_fails() {
         let result = PinnedMemory::allocate_ascend_host(0 /* device_id */, 0);
         assert!(matches!(result, Err(PinnedMemError::ZeroSize)));
+        let result =
+            PinnedMemory::allocate_ascend_registered(0 /* device_id */, 0, NumaNode::UNKNOWN);
+        assert!(matches!(result, Err(PinnedMemError::ZeroSize)));
+    }
+
+    #[cfg(feature = "ascend")]
+    #[test]
+    fn test_allocate_ascend_registered_is_mapped() {
+        use crate::device::ascend;
+        if ascend::ensure_acl_initialized().is_err() {
+            eprintln!("SKIP: cannot init ACL runtime");
+            return;
+        }
+        let device = match ascend::AscendDevice::new(0) {
+            Ok(device) => device,
+            Err(e) => {
+                eprintln!("SKIP: cannot create Ascend device 0: {e}");
+                return;
+            }
+        };
+        device.set_current().expect("set device 0");
+        let mem = PinnedMemory::allocate_ascend_registered(0, 4096, NumaNode::UNKNOWN)
+            .expect("allocate mmap + aclrtHostRegister memory");
+        assert_eq!((mem.as_ptr() as usize) % page_size(), 0);
+        assert_ne!(mem.device_ptr().as_ptr(), std::ptr::null_mut());
     }
 }

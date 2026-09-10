@@ -186,10 +186,11 @@ impl PinnedMemoryPool {
             #[cfg(not(feature = "cuda"))]
             {
                 info!(
-                    "Allocating pinned memory pool with aclrtMallocHost on {} (SSD enabled)",
+                    "Allocating RDMA-compatible pinned memory pool with mmap + \
+                     aclrtHostRegister on {} (SSD enabled)",
                     node
                 );
-                Self::allocate_ascend_host_fallback(pool_size, node)
+                Self::allocate_ascend_registered_fallback(pool_size, node)
             }
         } else {
             #[cfg(feature = "cuda")]
@@ -200,8 +201,10 @@ impl PinnedMemoryPool {
             }
             #[cfg(not(feature = "cuda"))]
             {
-                info!("Allocating pinned memory pool with aclrtMallocHost mapped pages");
-                Self::allocate_ascend_host_fallback(pool_size, node)
+                info!(
+                    "Allocating RDMA-compatible pinned memory pool with mmap + aclrtHostRegister"
+                );
+                Self::allocate_ascend_registered_fallback(pool_size, node)
             }
         };
 
@@ -249,12 +252,12 @@ impl PinnedMemoryPool {
         }
     }
 
-    /// Fallback allocation using Ascend's `aclrtMallocHost` when CUDA is not available.
+    /// Allocate RDMA-registerable host pages and map them into Ascend address space.
     ///
     /// Resolves the best NPU device for the given NUMA node, falling back to
     /// device 0 when the NUMA→device mapping is unknown.
     #[cfg(all(feature = "ascend", not(feature = "cuda")))]
-    fn allocate_ascend_host_fallback(size: usize, node: NumaNode) -> PinnedMemory {
+    fn allocate_ascend_registered_fallback(size: usize, node: NumaNode) -> PinnedMemory {
         use crate::pinned_mem::PinnedMemory;
         // Resolve device_id from NUMA node via the topology cache.
         // When NUMA info is unavailable, default to device 0 (single-NPU systems).
@@ -263,8 +266,8 @@ impl PinnedMemoryPool {
             "Ascend pinned pool on NUMA node {} → using device {}",
             node, device_id
         );
-        PinnedMemory::allocate_ascend_host(device_id, size)
-            .expect("Failed to allocate Ascend pinned memory pool via aclrtMallocHost")
+        PinnedMemory::allocate_ascend_registered(device_id, size, node)
+            .expect("Failed to allocate Ascend pinned memory pool via aclrtHostRegister")
     }
 
     /// Allocate pinned memory from the pool. Returns None when the allocation cannot be satisfied.
