@@ -125,7 +125,8 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     tp: usize,
 
-    /// Physical accelerator device IDs in TP-rank order. Empty means 0..tp.
+    /// Runtime-visible logical accelerator IDs in TP-rank order. Empty means
+    /// 0..tp. With ASCEND_RT_VISIBLE_DEVICES=0,2, use --devices 0,1.
     #[arg(long, value_delimiter = ',')]
     devices: Vec<usize>,
 

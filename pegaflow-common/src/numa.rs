@@ -10,6 +10,7 @@
 //! - Thread-to-NUMA-node pinning for first-touch allocation policy
 
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::mem;
 use std::process::Command;
@@ -260,6 +261,46 @@ where
 // Device NUMA affinity — npu-smi (Ascend NPU)
 // ============================================================================
 
+fn parse_ascend_visible_devices(value: &str) -> Result<Vec<u32>, String> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut devices = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err("empty device ID".to_string());
+        }
+        let device = item
+            .parse::<u32>()
+            .map_err(|_| format!("invalid device ID {item:?}"))?;
+        if devices.contains(&device) {
+            return Err(format!("duplicate device ID {device}"));
+        }
+        devices.push(device);
+    }
+    Ok(devices)
+}
+
+/// Return physical NPU IDs selected by `ASCEND_RT_VISIBLE_DEVICES`.
+///
+/// `None` means the variable is absent. An invalid value fails closed to an
+/// empty list so topology discovery cannot accidentally expose hidden devices.
+fn ascend_visible_physical_devices() -> Option<Vec<u32>> {
+    let value = env::var_os("ASCEND_RT_VISIBLE_DEVICES")?;
+    let Some(value) = value.to_str() else {
+        log::warn!("ASCEND_RT_VISIBLE_DEVICES is not valid UTF-8; exposing no NPUs");
+        return Some(Vec::new());
+    };
+    match parse_ascend_visible_devices(value) {
+        Ok(devices) => Some(devices),
+        Err(error) => {
+            log::warn!("Invalid ASCEND_RT_VISIBLE_DEVICES={value:?}: {error}; exposing no NPUs");
+            Some(Vec::new())
+        }
+    }
+}
+
 /// Discover NPU device count via `npu-smi info -m`.
 ///
 /// Parses the device listing to count unique Ascend NPU chips (skipping MCU
@@ -271,6 +312,10 @@ where
 /// NPU detection and NUMA affinity parsing without linking against
 /// the CANN runtime.
 pub fn get_npu_device_count() -> Option<u32> {
+    if let Some(devices) = ascend_visible_physical_devices() {
+        return Some(devices.len() as u32);
+    }
+
     // Primary: use npu-smi -m to list all devices
     if let Ok(output) = Command::new("npu-smi").args(["info", "-m"]).output()
         && output.status.success()
@@ -440,6 +485,14 @@ fn parse_first_int(s: &str) -> Option<u32> {
 /// This function is public so that integration tests can verify
 /// the full NPU-to-NUMA topology detection path.
 pub fn get_npu_numa_affinity() -> Vec<(u32, NumaNode)> {
+    if let Some(physical_devices) = ascend_visible_physical_devices() {
+        return physical_devices
+            .into_iter()
+            .enumerate()
+            .map(|(logical_id, physical_id)| (logical_id as u32, get_npu_numa_node(physical_id)))
+            .collect();
+    }
+
     let count = match get_npu_device_count() {
         Some(n) => n,
         None => return Vec::new(),
@@ -966,5 +1019,18 @@ mod tests {
         assert_eq!(parse_first_int("no numbers"), None);
         assert_eq!(parse_first_int("abc 42 def"), Some(42));
         assert_eq!(parse_first_int(""), None);
+    }
+
+    #[test]
+    fn test_parse_ascend_visible_devices() {
+        assert_eq!(parse_ascend_visible_devices("0,2").unwrap(), vec![0, 2]);
+        assert_eq!(
+            parse_ascend_visible_devices(" 0, 2, 1, 3 ").unwrap(),
+            vec![0, 2, 1, 3]
+        );
+        assert!(parse_ascend_visible_devices("0,,2").is_err());
+        assert!(parse_ascend_visible_devices("0,0").is_err());
+        assert!(parse_ascend_visible_devices("NPU0").is_err());
+        assert!(parse_ascend_visible_devices("").unwrap().is_empty());
     }
 }
