@@ -152,8 +152,13 @@ struct Cli {
     sets: usize,
 
     /// Pinned pool size in GiB. 0 = auto (sets * set bytes + 50% slack).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, conflicts_with = "pool_mib")]
     pool_gib: usize,
+
+    /// Pinned pool size in MiB. Useful for small integrity gates where a
+    /// GiB-scale MR would unnecessarily consume HCA translation resources.
+    #[arg(long, default_value_t = 0, conflicts_with = "pool_gib")]
+    pool_mib: usize,
 
     /// Allocate the pinned pool with huge pages.
     #[arg(long)]
@@ -855,7 +860,9 @@ async fn main() {
     };
     // Generous slack: if the pool runs tight the engine evicts earlier sets
     // (and deregisters them from MetaServer), which breaks the run.
-    let pool_bytes = if cli.pool_gib > 0 {
+    let pool_bytes = if cli.pool_mib > 0 {
+        cli.pool_mib << 20
+    } else if cli.pool_gib > 0 {
         cli.pool_gib << 30
     } else {
         (cli.sets * shape.set_bytes() + shape.set_bytes() / 2).max(1 << 30)
