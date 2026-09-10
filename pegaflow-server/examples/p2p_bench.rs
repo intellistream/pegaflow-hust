@@ -31,20 +31,24 @@
 //!   p2p_bench --role requester --holder-ip <A> --advertise-ip <B> \
 //!       --nics mlx5_0,... --verify
 
-use std::ffi::c_void;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+#[cfg(feature = "cuda")]
 use cudarc::driver::{CudaContext, sys};
 use log::info;
+#[cfg(feature = "ascend")]
+use pegaflow_core::device::ascend;
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::*;
 use pegaflow_metaserver::{BlockHashStore, GrpcMetaService};
 use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
+#[cfg(feature = "cuda")]
+use std::ffi::c_void;
 use tokio::sync::Notify;
 use tonic::transport::Server;
 
@@ -117,9 +121,13 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     segments: usize,
 
-    /// Tensor-parallel ranks; rank r uses CUDA device r. MLA uses tp=1.
+    /// Tensor-parallel ranks; rank r uses accelerator device r by default.
     #[arg(long, default_value_t = 8)]
     tp: usize,
+
+    /// Physical accelerator device IDs in TP-rank order. Empty means 0..tp.
+    #[arg(long, value_delimiter = ',')]
+    devices: Vec<usize>,
 
     /// Store one contiguous page per (block, tp_rank) instead of one slot per
     /// (block, layer, tp_rank). Collapses metadata ~num_layers. Single-segment only.
@@ -159,6 +167,13 @@ struct Cli {
 const NAMESPACE: &str = "p2p-bench";
 const INSTANCE: &str = "p2p-bench-inst";
 
+#[cfg(all(feature = "cuda", feature = "ascend"))]
+compile_error!("p2p_bench requires exactly one accelerator feature");
+
+#[cfg(not(any(feature = "cuda", feature = "ascend")))]
+compile_error!("p2p_bench requires either the cuda or ascend feature");
+
+#[cfg(feature = "cuda")]
 fn check_cuda(result: sys::CUresult, op: &str) {
     assert!(
         result == sys::CUresult::CUDA_SUCCESS,
@@ -166,14 +181,17 @@ fn check_cuda(result: sys::CUresult, op: &str) {
     );
 }
 
+#[cfg(feature = "cuda")]
 struct GpuBuffer {
     ctx: Arc<CudaContext>,
     ptr: sys::CUdeviceptr,
     len: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl GpuBuffer {
-    fn alloc(ctx: Arc<CudaContext>, len: usize) -> Self {
+    fn alloc(device: usize, len: usize) -> Self {
+        let ctx = CudaContext::new(device).expect("CUDA context");
         ctx.bind_to_thread().expect("bind CUDA context");
         let mut ptr: sys::CUdeviceptr = 0;
         check_cuda(
@@ -181,6 +199,10 @@ impl GpuBuffer {
             "cuMemAlloc_v2",
         );
         Self { ctx, ptr, len }
+    }
+
+    fn ptr(&self) -> u64 {
+        self.ptr
     }
 
     fn copy_from_host(&self, data: &[u8]) {
@@ -208,6 +230,56 @@ impl GpuBuffer {
             unsafe { sys::cuMemsetD8_v2(self.ptr, 0, self.len) },
             "memset",
         );
+    }
+}
+
+#[cfg(feature = "ascend")]
+struct GpuBuffer {
+    device: ascend::AscendDevice,
+    ptr: u64,
+    len: usize,
+}
+
+#[cfg(feature = "ascend")]
+impl GpuBuffer {
+    fn alloc(device: usize, len: usize) -> Self {
+        ascend::ensure_acl_initialized().expect("initialize ACL");
+        let device = ascend::AscendDevice::new(device as i32).expect("Ascend device");
+        device.set_current().expect("set Ascend device");
+        let ptr = ascend::malloc_device(len, 0).expect("aclrtMalloc");
+        Self { device, ptr, len }
+    }
+
+    fn ptr(&self) -> u64 {
+        self.ptr
+    }
+
+    fn copy_from_host(&self, data: &[u8]) {
+        assert_eq!(data.len(), self.len);
+        self.device.set_current().expect("set Ascend device");
+        ascend::memcpy_h2d_sync(self.ptr, data.as_ptr(), self.len).expect("aclrtMemcpy H2D");
+    }
+
+    fn copy_to_host(&self) -> Vec<u8> {
+        self.device.set_current().expect("set Ascend device");
+        let mut out = vec![0u8; self.len];
+        ascend::memcpy_d2h_sync(out.as_mut_ptr(), self.ptr, self.len).expect("aclrtMemcpy D2H");
+        out
+    }
+
+    fn zero(&self) {
+        self.device.set_current().expect("set Ascend device");
+        let zeros = vec![0u8; self.len];
+        ascend::memcpy_h2d_sync(self.ptr, zeros.as_ptr(), self.len).expect("aclrtMemcpy zero H2D");
+    }
+}
+
+#[cfg(feature = "ascend")]
+impl Drop for GpuBuffer {
+    fn drop(&mut self) {
+        if self.device.set_current().is_ok() {
+            let _ = ascend::free_device(self.ptr);
+        }
     }
 }
 
@@ -367,7 +439,12 @@ fn make_block_hashes(blocks: usize, set: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn register_ranks(engine: &PegaEngine, shape: &Shape, page_first: bool) -> Vec<RankBuffers> {
+fn register_ranks(
+    engine: &PegaEngine,
+    shape: &Shape,
+    page_first: bool,
+    devices: &[usize],
+) -> Vec<RankBuffers> {
     let layer_names = shape.layer_names();
     let size_bytes: Vec<usize> = shape
         .layers
@@ -386,19 +463,21 @@ fn register_ranks(engine: &PegaEngine, shape: &Shape, page_first: bool) -> Vec<R
     // distinguished only by device_id. Dense: tp_rank=device, tp_size=tp.
     let eng_tp = shape.eng_tp_size();
 
-    (0..shape.tp)
-        .map(|rank| {
-            let ctx = CudaContext::new(rank).expect("CUDA context");
-            let buf = GpuBuffer::alloc(ctx, shape.rank_bytes());
+    devices
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(rank, device)| {
+            let buf = GpuBuffer::alloc(device, shape.rank_bytes());
             let ptrs: Vec<u64> = (0..shape.num_layers())
-                .map(|l| buf.ptr + shape.layer_offset(l) as u64)
+                .map(|l| buf.ptr() + shape.layer_offset(l) as u64)
                 .collect();
             let tp_rank = if shape.mla_replica { 0 } else { rank };
             engine
                 .register_context_layer_batch(
                     INSTANCE,
                     NAMESPACE,
-                    rank as i32, // device_id (the worker key)
+                    device as i32, // device_id (the worker key)
                     tp_rank,
                     0, // pp_rank
                     eng_tp,
@@ -414,7 +493,7 @@ fn register_ranks(engine: &PegaEngine, shape: &Shape, page_first: bool) -> Vec<R
                     page_first,
                 )
                 .expect("register rank");
-            RankBuffers { device: rank, buf }
+            RankBuffers { device, buf }
         })
         .collect()
 }
@@ -476,7 +555,7 @@ fn report_metadata(shape: &Shape, page_first: bool) {
     );
 }
 
-async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
+async fn run_holder(cli: &Cli, shape: &Shape, devices: &[usize], pool_bytes: usize) {
     let meta_addr: SocketAddr = ([0, 0, 0, 0], cli.meta_port).into();
     let meta_store = Arc::new(BlockHashStore::new());
     let meta_service = GrpcMetaService::new(Arc::clone(&meta_store));
@@ -520,7 +599,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
             .expect("Engine gRPC serve");
     });
 
-    let ranks = register_ranks(&engine, shape, cli.page_first);
+    let ranks = register_ranks(&engine, shape, cli.page_first, devices);
     let layer_names = shape.layer_names();
 
     let mut image = vec![0u8; shape.rank_bytes()];
@@ -592,7 +671,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
     tokio::signal::ctrl_c().await.expect("ctrl_c");
 }
 
-async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
+async fn run_requester(cli: &Cli, shape: &Shape, devices: &[usize], pool_bytes: usize) {
     let holder_ip = cli
         .holder_ip
         .as_deref()
@@ -608,7 +687,7 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
         PegaEngine::new_with_config(pool_bytes, cli.use_hugepages, config)
             .expect("requester engine"),
     );
-    let ranks = register_ranks(&engine, shape, cli.page_first);
+    let ranks = register_ranks(&engine, shape, cli.page_first, devices);
     let set_mib = shape.set_bytes() as f64 / (1024.0 * 1024.0);
     report_metadata(shape, cli.page_first);
 
@@ -750,6 +829,17 @@ async fn main() {
     let cli = Cli::parse();
     pegaflow_common::logging::init_stdout_colored("info");
 
+    let devices: Vec<usize> = if cli.devices.is_empty() {
+        (0..cli.tp).collect()
+    } else {
+        assert_eq!(
+            cli.devices.len(),
+            cli.tp,
+            "--devices must contain exactly --tp device IDs"
+        );
+        cli.devices.clone()
+    };
+
     let shape = Shape {
         layers: build_layers(&cli),
         tp: cli.tp,
@@ -764,7 +854,7 @@ async fn main() {
         (cli.sets * shape.set_bytes() + shape.set_bytes() / 2).max(1 << 30)
     };
     info!(
-        "p2p_bench role={:?} model={:?} layers={} tp={} blocks={} sets={} \
+        "p2p_bench role={:?} model={:?} layers={} tp={} devices={devices:?} blocks={} sets={} \
          set_bytes={:.1}MiB pool={:.1}GiB page_first={} mla_replica={}",
         cli.role,
         cli.model,
@@ -779,7 +869,7 @@ async fn main() {
     );
 
     match cli.role {
-        Role::Holder => run_holder(&cli, &shape, pool_bytes).await,
-        Role::Requester => run_requester(&cli, &shape, pool_bytes).await,
+        Role::Holder => run_holder(&cli, &shape, &devices, pool_bytes).await,
+        Role::Requester => run_requester(&cli, &shape, &devices, pool_bytes).await,
     }
 }

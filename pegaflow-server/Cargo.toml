@@ -72,4 +72,4 @@ required-features = ["cuda"]
 
 [[example]]
 name = "p2p_bench"
-required-features = ["cuda"]
+required-features = ["rdma"]
