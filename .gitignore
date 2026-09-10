@@ -18,6 +18,7 @@ python/tests/*.log
 # Built binaries in Python package (generated during wheel build)
 python/pegaflow/pegaflow-server
 python/pegaflow/pegaflow-server-py
+python/pegaflow/pegaflow-metaserver-py
 
 # IDE
 .vscode/
