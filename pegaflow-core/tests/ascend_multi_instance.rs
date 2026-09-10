@@ -324,7 +324,7 @@ fn ascend_load_save_concurrent_streams() {
     let (host_ptr, _) = ascend::malloc_host(0, SIZE).expect("aclrtMallocHost");
 
     // Write test pattern
-    let src: Vec<u8> = (0..SIZE as u8).map(|i| i.wrapping_mul(3)).collect();
+    let src: Vec<u8> = (0..SIZE).map(|i| (i as u8).wrapping_mul(3)).collect();
     ascend::memcpy_h2d_sync(dev_ptr, src.as_ptr(), SIZE).expect("initial H2D");
 
     let backend = AscendMemcpyBackend;
@@ -488,7 +488,7 @@ fn ascend_device_context_roundtrip_via_enum() {
 #[test]
 fn ascend_memcpy_backend_trait_compliance() {
     let backend = AscendMemcpyBackend;
-    assert_eq!(backend.name(), "ascend_direct");
+    assert_eq!(backend.name(), "ascend_batch");
     eprintln!("PASS: ascend_memcpy_backend_trait_compliance");
 }
 

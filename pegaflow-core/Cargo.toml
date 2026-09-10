@@ -76,6 +76,34 @@ harness = false
 
 [[example]]
 name = "pinned_alloc"
+required-features = ["cuda"]
 
 [[example]]
 name = "pinned_alloc_parallel"
+required-features = ["cuda"]
+
+# These integration tests exercise the CUDA test harness. Keep them out of an
+# Ascend-only build instead of compiling cudarc when the cuda feature is off.
+[[test]]
+name = "engine_basic"
+required-features = ["cuda"]
+
+[[test]]
+name = "eviction"
+required-features = ["cuda"]
+
+[[test]]
+name = "prefetch_lease"
+required-features = ["cuda"]
+
+[[test]]
+name = "prefix_semantics"
+required-features = ["cuda"]
+
+[[test]]
+name = "save_validation"
+required-features = ["cuda"]
+
+[[test]]
+name = "ssd_cache"
+required-features = ["cuda"]

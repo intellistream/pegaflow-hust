@@ -225,7 +225,23 @@ class TestSaveLoadThreadSimulation:
 
 
 class TestIPCWrapperMultiDevice:
-    """Verify NpuIPCWrapper correctly serializes across multiple devices."""
+    """Verify NpuIPCWrapper serializes global physical device IDs.
+
+    vLLM workers can be visibility-masked while pegaflow-server intentionally
+    runs with the full physical device view.  The wrapper therefore carries
+    the physical ID, not the worker-local logical index.
+    """
+
+    @staticmethod
+    def _physical_device_id(local_device_id: int) -> int:
+        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+        if not visible:
+            return local_device_id
+        slots = [slot.strip() for slot in visible.split(",") if slot.strip()]
+        try:
+            return int(slots[local_device_id])
+        except (IndexError, ValueError):
+            return local_device_id
 
     def test_wrapper_preserves_device_index_after_roundtrip(self):
         """Each wrapper retains its original device_index through pickle."""
@@ -248,10 +264,15 @@ class TestIPCWrapperMultiDevice:
         data = pickle.dumps(wrappers)
         restored = pickle.loads(data)
 
-        for i, (_orig, rest) in enumerate(zip(wrappers, restored, strict=False)):
-            assert rest.device_index == i, (
-                f"wrapper {i}: expected device_index {i}, got {rest.device_index}"
+        for local_id, (_orig, rest) in enumerate(
+            zip(wrappers, restored, strict=False)
+        ):
+            expected = self._physical_device_id(local_id)
+            assert rest.device_index == expected, (
+                f"wrapper {local_id}: expected physical device_index "
+                f"{expected}, got {rest.device_index}"
             )
+            assert rest._handle[0] == expected
 
     def test_wrapper_from_higher_device_index(self):
         """Wrapper from a non-zero device preserves its index."""
@@ -267,11 +288,14 @@ class TestIPCWrapperMultiDevice:
         t = torch.ones(32, dtype=torch.float16, device=device)
         wrapper = NpuIPCWrapper(t)
 
-        assert wrapper.device_index == 1
+        expected = self._physical_device_id(1)
+        assert wrapper.device_index == expected
+        assert wrapper._handle[0] == expected
 
         data = pickle.dumps(wrapper)
         restored = pickle.loads(data)
-        assert restored.device_index == 1
+        assert restored.device_index == expected
+        assert restored._handle[0] == expected
 
 
 # ---------------------------------------------------------------------------

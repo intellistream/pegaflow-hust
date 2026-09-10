@@ -93,26 +93,26 @@ mod tests {
 
     #[test]
     fn compatible_version_equal_to_minimum() {
-        assert!(is_compatible_ascend_version(8, 5, 8, 5, 0));
+        assert!(is_compatible_ascend_version(1, 16, 1, 16, 0));
     }
 
     #[test]
     fn compatible_version_higher_minor() {
-        assert!(is_compatible_ascend_version(8, 5, 8, 7, 0));
+        assert!(is_compatible_ascend_version(1, 16, 1, 17, 0));
     }
 
     #[test]
     fn compatible_version_higher_major() {
-        assert!(is_compatible_ascend_version(8, 5, 9, 0, 0));
+        assert!(is_compatible_ascend_version(1, 16, 2, 0, 0));
     }
 
     #[test]
     fn incompatible_version_lower_minor() {
-        assert!(!is_compatible_ascend_version(8, 5, 8, 4, 0));
+        assert!(!is_compatible_ascend_version(1, 16, 1, 15, 0));
     }
 
     #[test]
     fn incompatible_version_lower_major() {
-        assert!(!is_compatible_ascend_version(8, 5, 7, 0, 0));
+        assert!(!is_compatible_ascend_version(1, 16, 0, 99, 0));
     }
 }

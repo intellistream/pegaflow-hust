@@ -92,7 +92,7 @@ fn ascend_unified_save_load_chain() {
 
     // ─ Layer 4: Allocate pinned host memory (simulating engine mem pool) ─
 
-    let (host_ptr, _device_ptr) = ascend::malloc_host(SIZE).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(0, SIZE).expect("aclrtMallocHost");
 
     eprintln!(
         "INFO: Pinned host memory allocated: host=0x{:x}",
@@ -197,7 +197,7 @@ fn ascend_unified_multi_layer() {
     let policy: i32 = 0;
 
     let dev_ptr = ascend::malloc_device(TOTAL, policy).expect("aclrtMalloc");
-    let (host_ptr, _device_ptr) = ascend::malloc_host(TOTAL).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(0, TOTAL).expect("aclrtMallocHost");
 
     // Fill each layer with distinct patterns
     let mut src_data = vec![0u8; TOTAL];

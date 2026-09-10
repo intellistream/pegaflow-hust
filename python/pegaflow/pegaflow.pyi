@@ -37,7 +37,7 @@ class NpuIPCWrapper:
         shape: Shape tuple of the tensor.
         stride: Stride tuple of the tensor.
         storage_offset: Storage offset (must be zero).
-        device_index: NPU device index (relative to ASCEND_VISIBLE_DEVICES).
+        device_index: Global physical NPU device index used by the server.
     """
 
     def __init__(self, tensor: object) -> None: ...

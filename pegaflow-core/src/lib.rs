@@ -922,6 +922,9 @@ mod tests {
     fn rdma_initialization_failure_is_returned_to_caller() {
         let config = storage::StorageConfig {
             rdma_nic_names: Some(vec!["definitely-not-a-real-nic".to_string()]),
+            // This test isolates RDMA initialization. Avoid allocating one
+            // pinned pool per detected accelerator/NUMA node first.
+            enable_numa_affinity: false,
             ..storage::StorageConfig::default()
         };
 

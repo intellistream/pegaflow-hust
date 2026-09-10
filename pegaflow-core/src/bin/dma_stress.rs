@@ -8,6 +8,8 @@
 use std::env;
 use std::sync::Arc;
 
+use pegaflow_core::transfer::{AscendMemcpyBackend, CopyDesc, TransferBackend};
+
 fn main() -> Result<(), String> {
     pegaflow_common::logging::init_stderr("info,pegaflow_core=debug");
 
@@ -75,27 +77,25 @@ fn main() -> Result<(), String> {
     // ================================================================
     println!("\n--- Test 2+3: SKIPPED ---");
 
-    let ascend_stream = match stream.as_ref() {
-        pegaflow_core::device::DeviceStream::Ascend(s) => s,
-        _ => unreachable!(),
-    };
-
     // ================================================================
     // Test 4: Use batch API (aclrtMemcpyBatchAsync) — same data, one call
     // ================================================================
     println!("\n--- Test 4: Batch API — 100 copies via aclrtMemcpyBatchAsync ---");
-    let batch_copies: Vec<(u64, *mut u8, usize)> = (0..100)
+    let batch_copies: Vec<CopyDesc> = (0..100)
         .map(|i| {
             let idx = i % num_blocks;
-            (
-                dev_ptr + (idx * block_size) as u64,
-                unsafe { host_ptr.add(idx * block_size) },
-                block_size,
-            )
+            let host = unsafe { host_ptr.add(idx * block_size) };
+            CopyDesc {
+                device: dev_ptr + (idx * block_size) as u64,
+                host,
+                host_device: host as u64,
+                size: block_size,
+            }
         })
         .collect();
+    let backend = AscendMemcpyBackend::new(device_id);
     let t0 = std::time::Instant::now();
-    match pegaflow_core::device::ascend::memcpy_batch_h2d(&batch_copies, device_id, ascend_stream) {
+    match backend.h2d(&batch_copies, &stream) {
         Ok(()) => println!(
             "  Batch submit OK  elapsed={:.2}ms",
             t0.elapsed().as_secs_f64() * 1000.0
@@ -114,18 +114,20 @@ fn main() -> Result<(), String> {
     // Test 5: Batch API — 1000 copies
     // ================================================================
     println!("\n--- Test 5: Batch API — 1000 copies via aclrtMemcpyBatchAsync ---");
-    let batch_copies: Vec<(u64, *mut u8, usize)> = (0..1000)
+    let batch_copies: Vec<CopyDesc> = (0..1000)
         .map(|i| {
             let idx = i % num_blocks;
-            (
-                dev_ptr + (idx * block_size) as u64,
-                unsafe { host_ptr.add(idx * block_size) },
-                block_size,
-            )
+            let host = unsafe { host_ptr.add(idx * block_size) };
+            CopyDesc {
+                device: dev_ptr + (idx * block_size) as u64,
+                host,
+                host_device: host as u64,
+                size: block_size,
+            }
         })
         .collect();
     let t0 = std::time::Instant::now();
-    match pegaflow_core::device::ascend::memcpy_batch_h2d(&batch_copies, device_id, ascend_stream) {
+    match backend.h2d(&batch_copies, &stream) {
         Ok(()) => println!(
             "  Batch submit OK  elapsed={:.2}ms",
             t0.elapsed().as_secs_f64() * 1000.0

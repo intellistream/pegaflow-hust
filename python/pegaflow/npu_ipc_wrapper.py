@@ -174,11 +174,13 @@ class NpuIPCWrapper:
     that allocator.  Standard ``torch.npu.empty`` tensors allocated through
     the default CANN allocator are **not** IPC-exportable.
 
-    The wrapper stores the NPU device index directly (rather than using
-    UUID-based discovery).  Ascend NPU UUIDs may be non-unique (e.g. all
-    zero), so UUID-based remapping is unreliable.  This is safe because
-    both the vLLM worker and the pegaflow-server process share the same
-    ``ASCEND_VISIBLE_DEVICES`` environment variable and device ordering.
+    The wrapper stores the global physical NPU device index directly (rather
+    than using UUID-based discovery).  Ascend NPU UUIDs may be non-unique
+    (e.g. all zero), so UUID-based remapping is unreliable.  A vLLM worker may
+    use ``ASCEND_RT_VISIBLE_DEVICES`` and therefore see local logical indices;
+    the wrapper maps those indices back to the physical IDs before it crosses
+    the process boundary.  The pegaflow-server must run with the full physical
+    device view and its ``--devices`` list must use the same physical IDs.
 
     Attributes:
         key: CANN IPC export key bytes (C string from aclrtIpcMemGetExportKey).
@@ -186,7 +188,7 @@ class NpuIPCWrapper:
         shape: Shape tuple of the tensor.
         stride: Stride tuple of the tensor.
         storage_offset: Storage offset (must be zero).
-        device_index: NPU device index (relative to ASCEND_VISIBLE_DEVICES).
+        device_index: Global physical NPU device index used by the server.
     """
 
     # ------------------------------------------------------------------

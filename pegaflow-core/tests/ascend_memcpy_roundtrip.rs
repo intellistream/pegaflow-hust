@@ -54,11 +54,11 @@ fn ascend_memcpy_d2h_h2d_roundtrip_4096() {
     };
 
     // Write test pattern to device via sync H2D
-    let src: Vec<u8> = (0..SIZE as u8).map(|i| i.wrapping_mul(3)).collect();
+    let src: Vec<u8> = (0..SIZE).map(|i| (i as u8).wrapping_mul(3)).collect();
     ascend::memcpy_h2d_sync(dev_ptr, src.as_ptr(), SIZE).expect("sync H2D of test pattern");
 
     // Allocate pinned host memory
-    let (host_ptr, _device_ptr) = ascend::malloc_host(SIZE).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(0, SIZE).expect("aclrtMallocHost");
 
     // Create stream for async operations
     let stream = device.create_stream().expect("create stream");
@@ -118,10 +118,10 @@ fn ascend_memcpy_stress_10k_small() {
         }
     };
 
-    let (host_ptr, _device_ptr) = ascend::malloc_host(SIZE).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(0, SIZE).expect("aclrtMallocHost");
     let stream = device.create_stream().expect("create stream");
 
-    let src_pattern: Vec<u8> = (0..SIZE as u8).map(|i| i.wrapping_add(0x55)).collect();
+    let src_pattern: Vec<u8> = (0..SIZE).map(|i| (i as u8).wrapping_add(0x55)).collect();
     ascend::memcpy_h2d_sync(dev_ptr, src_pattern.as_ptr(), SIZE).expect("initial H2D");
 
     for i in 0..ITERATIONS {
@@ -171,7 +171,7 @@ fn ascend_memcpy_single_byte() {
     let policy: i32 = 0;
 
     let dev_ptr = ascend::malloc_device(SIZE, policy).expect("malloc_device 1B");
-    let (host_ptr, _device_ptr) = ascend::malloc_host(SIZE).expect("malloc_host 1B");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(0, SIZE).expect("malloc_host 1B");
     let stream = device.create_stream().expect("create stream");
 
     let src: [u8; 1] = [0xAA];
@@ -216,7 +216,7 @@ fn ascend_pinned_host_alignment() {
     let sizes: &[usize] = &[1, 7, 8, 15, 64, 65, 127, 128, 255, 4096, 65536];
 
     for &size in sizes {
-        let (host, _device) = ascend::malloc_host(size)
+        let (host, _device) = ascend::malloc_host(0, size)
             .unwrap_or_else(|e| panic!("aclrtMallocHost({size}) failed: {e}"));
         let addr = host as usize;
         let aligned = addr % 64 == 0;
@@ -255,10 +255,10 @@ fn ascend_transfer_backend_roundtrip() {
     let policy: i32 = 0;
 
     let dev_ptr = ascend::malloc_device(SIZE, policy).expect("aclrtMalloc");
-    let (host_ptr, _device_ptr) = ascend::malloc_host(SIZE).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(0, SIZE).expect("aclrtMallocHost");
 
     // Write pattern to device
-    let src: Vec<u8> = (0..SIZE as u8).map(|i| i.wrapping_mul(7)).collect();
+    let src: Vec<u8> = (0..SIZE).map(|i| (i as u8).wrapping_mul(7)).collect();
     ascend::memcpy_h2d_sync(dev_ptr, src.as_ptr(), SIZE).expect("initial H2D");
 
     let stream = device.create_stream().expect("create stream");
@@ -320,9 +320,9 @@ fn ascend_transfer_backend_coalesced() {
     let policy: i32 = 0;
 
     let dev_ptr = ascend::malloc_device(TOTAL, policy).expect("aclrtMalloc");
-    let (host_ptr, _device_ptr) = ascend::malloc_host(TOTAL).expect("aclrtMallocHost");
+    let (host_ptr, _device_ptr) = ascend::malloc_host(0, TOTAL).expect("aclrtMallocHost");
 
-    let src: Vec<u8> = (0..TOTAL as u8).map(|i| i.wrapping_mul(3)).collect();
+    let src: Vec<u8> = (0..TOTAL).map(|i| (i as u8).wrapping_mul(3)).collect();
     ascend::memcpy_h2d_sync(dev_ptr, src.as_ptr(), TOTAL).expect("initial H2D");
 
     let stream = device.create_stream().expect("create stream");

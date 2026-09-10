@@ -55,3 +55,21 @@ pegaflow-metaserver = { path = "../pegaflow-metaserver", default-features = fals
 
 [build-dependencies]
 pyo3-build-config.workspace = true
+
+# The current server integration harnesses allocate CUDA buffers directly.
+# Do not compile them in an Ascend-only validation build.
+[[test]]
+name = "http_cleanup_hang_repro"
+required-features = ["cuda"]
+
+[[test]]
+name = "mock_vllm_rpc_e2e"
+required-features = ["cuda"]
+
+[[test]]
+name = "p2p_rdma"
+required-features = ["cuda"]
+
+[[example]]
+name = "p2p_bench"
+required-features = ["cuda"]

@@ -756,18 +756,15 @@ fn memcpy_batch_async(
 
 // -- Device allocation (test helpers) -------------------------------------
 
-/// Allocate device memory via `aclrtMalloc`. Returns a raw device pointer as `u64`.
+/// Allocate device memory on the caller's current device via `aclrtMalloc`.
+/// Returns a raw device pointer as `u64`.
 ///
 /// `policy` is the ACL memory policy (typically 0 for default).
+/// The caller must set the intended device context first. Avoid resetting to
+/// device 0 here: doing so silently allocates multi-device worker buffers on
+/// the wrong NPU.
 pub fn malloc_device(size: usize, policy: i32) -> Result<u64, String> {
     ensure_acl_initialized()?;
-    // aclrtMalloc requires an active device context
-    let ret = unsafe { aclrtSetDevice(0) };
-    if ret != ACL_ERROR_NONE {
-        return Err(format!(
-            "aclrtSetDevice(0) before malloc_device({size}) failed: error code {ret}"
-        ));
-    }
     if size == 0 {
         return Err("aclrtMalloc: size must be > 0".into());
     }
@@ -792,15 +789,10 @@ pub fn free_device(ptr: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Synchronous host-to-device memory copy (blocking, no stream needed).
+/// Synchronous host-to-device memory copy on the caller's current device
+/// (blocking, no stream needed).
 pub fn memcpy_h2d_sync(dst_device: u64, src_host: *const u8, size: usize) -> Result<(), String> {
     ensure_acl_initialized()?;
-    let ret = unsafe { aclrtSetDevice(0) };
-    if ret != ACL_ERROR_NONE {
-        return Err(format!(
-            "aclrtSetDevice(0) before memcpy_h2d_sync failed: error code {ret}"
-        ));
-    }
     let ret = unsafe {
         aclrtMemcpy(
             dst_device as *mut c_void,

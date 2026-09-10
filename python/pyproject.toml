@@ -32,6 +32,14 @@ classifiers = [
 [tool.maturin]
 module-name = "pegaflow.pegaflow"
 python-source = "."
+# Maturin 1.15 emits a random UUID and wall-clock timestamp in its generated
+# Rust SBOM.  Disable only that packaging metadata so independent P/D builds
+# of the same locked source produce byte-identical wheels.
+sbom = { rust = false, auditwheel = false }
+# Source-tree bytecode caches contain timestamp/path-derived headers and must
+# never be packaged. They are ignored by git but maturin otherwise discovers
+# them recursively after running the test suite.
+exclude = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo"]
 # Automatically include binaries defined in Cargo.toml [[bin]] sections
 include = ["pegaflow/pegaflow-server-py", "pegaflow/pegaflow-metaserver-py"]
 
